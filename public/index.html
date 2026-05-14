@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Orchestrator</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="chat-shell" aria-label="AI Orchestrator 对话">
+        <header class="topbar">
+          <div>
+            <h1>AI Orchestrator</h1>
+            <p>Router + RAG + SQLite + LanceDB</p>
+          </div>
+          <span id="status" class="status">检查中</span>
+        </header>
+
+        <div id="messages" class="messages">
+          <article class="message assistant">
+            <div class="bubble">
+              可以直接对话，也可以说“写入数据库：...”或“查询数据库：...”。我会把路由、召回和执行结果放在右侧详情里。
+            </div>
+          </article>
+        </div>
+
+        <form id="chat-form" class="composer">
+          <textarea
+            id="message-input"
+            name="message"
+            rows="3"
+            placeholder="输入：写入数据库：标题：架构原则&#10;Orchestrator 是代码主导、模型辅助的调度系统。"
+          ></textarea>
+          <button type="submit">发送</button>
+        </form>
+      </section>
+
+      <aside class="side-panel" aria-label="请求详情">
+        <h2>详情</h2>
+        <pre id="details">{}</pre>
+      </aside>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
