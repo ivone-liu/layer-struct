@@ -161,7 +161,7 @@ export class Orchestrator {
         {
           role: "system",
           content:
-            "你是减法版 AI Orchestrator 的最终生成模型。你不重新决定系统路径，只基于给定任务包回答。"
+            "你是 AI Orchestrator 的最终生成模型。你不重新决定系统路径，只基于给定任务包回答。"
         },
         ...history,
         { role: "user", content: prompt }
