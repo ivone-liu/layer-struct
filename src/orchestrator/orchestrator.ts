@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { AppConfig } from "../config/env.js";
 import { SqliteStore } from "../storage/sqliteStore.js";
-import type { ChatResponse, ExecutionResult, RequestContext, RoutePlan, StoredDocumentInput } from "../types.js";
+import type {
+  ChatResponse,
+  ChatStreamCallbacks,
+  ExecutionResult,
+  EvidencePack,
+  RequestContext,
+  RoutePlan,
+  StoredDocumentInput
+} from "../types.js";
 import { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
 import { buildFinalPrompt, defaultConstraints } from "./contextBuilder.js";
 import { extractQueryPayload, extractWritePayload, Router } from "./router.js";
@@ -53,6 +61,55 @@ export class Orchestrator {
       evidencePack,
       executionResult
     };
+  }
+
+  async chatStream(
+    input: { message: string; sessionId?: string; userId?: string; projectId?: string },
+    callbacks: ChatStreamCallbacks
+  ): Promise<ChatResponse> {
+    const context = createRequestContext(input, this.config.defaultProjectId);
+    this.sqlite.insertMessage({
+      id: randomUUID(),
+      sessionId: context.sessionId,
+      role: "user",
+      content: context.message,
+      createdAt: context.createdAt
+    });
+
+    const immediateReply = buildImmediateReply(context.message);
+    await callbacks.onEvent({ type: "assistant_delta", content: immediateReply });
+    await callbacks.onEvent({ type: "status", message: "执行中..." });
+
+    const routePlan = await this.router.route(context);
+    this.sqlite.insertRouteLog(context, routePlan);
+
+    const executionResult = await this.executeIfNeeded(context, routePlan);
+    const evidencePack = await this.retrieveIfNeeded(context, routePlan, executionResult);
+    await callbacks.onEvent({ type: "metadata", routePlan, evidencePack, executionResult });
+
+    let finalAnswer = "";
+    for await (const chunk of this.generateAnswerStream(context, routePlan, executionResult, evidencePack)) {
+      finalAnswer += chunk;
+      await callbacks.onEvent({ type: "assistant_delta", content: chunk });
+    }
+
+    const answer = `${immediateReply}${finalAnswer}`;
+    this.sqlite.insertMessage({
+      id: randomUUID(),
+      sessionId: context.sessionId,
+      role: "assistant",
+      content: answer,
+      createdAt: new Date().toISOString()
+    });
+
+    const result = {
+      answer,
+      routePlan,
+      evidencePack,
+      executionResult
+    };
+    await callbacks.onEvent({ type: "done", ...result });
+    return result;
   }
 
   async writeDocument(input: StoredDocumentInput): Promise<ExecutionResult> {
@@ -178,19 +235,13 @@ export class Orchestrator {
     context: RequestContext,
     routePlan: RoutePlan,
     executionResult?: ExecutionResult,
-    evidencePack?: Awaited<ReturnType<DocumentService["search"]>>
+    evidencePack?: EvidencePack
   ): Promise<string> {
     if (
       executionResult?.capabilityId === "workflow.ingest_text_database" ||
       executionResult?.capabilityId === "workflow.ingest_wechat_article"
     ) {
-      if (executionResult.status === "success") {
-        const title = executionResult.output?.title ? `，标题：${String(executionResult.output.title)}` : "";
-        return `已写入数据库${title}。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(
-          executionResult.output?.chunkCount
-        )}。`;
-      }
-      return `写入数据库失败：${executionResult.error ?? executionResult.message}`;
+      return this.renderWorkflowAnswer(executionResult);
     }
 
     if (!this.ai.canChat(this.config.ai.chatModel)) {
@@ -212,17 +263,83 @@ export class Orchestrator {
     return this.ai.chat({
       model: this.config.ai.chatModel,
       temperature: 0.3,
-      messages: [
-        {
-          role: "system",
-          content:
-            "你是 AI Orchestrator 的最终生成模型。你不重新决定系统路径，只基于给定任务包回答。"
-        },
-        ...history,
-        { role: "user", content: prompt }
-      ]
+      messages: buildFinalMessages(history, prompt)
     });
   }
+
+  private async *generateAnswerStream(
+    context: RequestContext,
+    routePlan: RoutePlan,
+    executionResult?: ExecutionResult,
+    evidencePack?: EvidencePack
+  ): AsyncGenerator<string> {
+    if (
+      executionResult?.capabilityId === "workflow.ingest_text_database" ||
+      executionResult?.capabilityId === "workflow.ingest_wechat_article"
+    ) {
+      yield this.renderWorkflowAnswer(executionResult);
+      return;
+    }
+
+    if (!this.ai.canChat(this.config.ai.chatModel)) {
+      yield evidencePack
+        ? renderEvidenceFallback(evidencePack.items)
+        : "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。";
+      return;
+    }
+
+    const history = this.sqlite.listSessionMessages(context.sessionId, 8);
+    const prompt = buildFinalPrompt({
+      request: context,
+      routePlan,
+      evidencePack,
+      executionResult,
+      constraints: defaultConstraints()
+    });
+
+    for await (const chunk of this.ai.streamChat({
+      model: this.config.ai.chatModel,
+      temperature: 0.3,
+      messages: buildFinalMessages(history, prompt)
+    })) {
+      yield chunk;
+    }
+  }
+
+  private renderWorkflowAnswer(executionResult: ExecutionResult): string {
+    if (executionResult.status === "success") {
+      const title = executionResult.output?.title ? `，标题：${String(executionResult.output.title)}` : "";
+      return `已写入数据库${title}。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(
+        executionResult.output?.chunkCount
+      )}。`;
+    }
+    return `写入数据库失败：${executionResult.error ?? executionResult.message}`;
+  }
+}
+
+function buildFinalMessages(history: Array<{ role: "system" | "user" | "assistant"; content: string }>, prompt: string) {
+  return [
+    {
+      role: "system" as const,
+      content: "你是 AI Orchestrator 的最终生成模型。你不重新决定系统路径，只基于给定任务包回答。"
+    },
+    ...history,
+    { role: "user" as const, content: prompt }
+  ];
+}
+
+function buildImmediateReply(message: string): string {
+  const normalized = message.trim();
+  if (extractWeChatArticleUrl(normalized)) {
+    return "收到，我会先处理这篇公众号文章，并进入 Orchestrator 执行写入流程。\n\n执行中...\n\n";
+  }
+  if (/写入|存入|保存|入库|记录/.test(normalized)) {
+    return "收到，我会先按你的要求整理内容，并进入 Orchestrator 执行写入流程。\n\n执行中...\n\n";
+  }
+  if (/查询|检索|搜索|数据库|知识库|资料库/.test(normalized)) {
+    return "收到，我会先按你的问题去资料库检索，再基于证据组织回答。\n\n执行中...\n\n";
+  }
+  return "收到，我先理解你的问题，并进入 Orchestrator 继续处理。\n\n执行中...\n\n";
 }
 
 function createRequestContext(

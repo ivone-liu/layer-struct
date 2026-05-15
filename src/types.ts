@@ -88,6 +88,17 @@ export interface ChatResponse {
   executionResult?: ExecutionResult;
 }
 
+export type ChatStreamEvent =
+  | { type: "assistant_delta"; content: string }
+  | { type: "status"; message: string }
+  | { type: "metadata"; routePlan: RoutePlan; evidencePack?: EvidencePack; executionResult?: ExecutionResult }
+  | { type: "done"; answer: string; routePlan: RoutePlan; evidencePack?: EvidencePack; executionResult?: ExecutionResult }
+  | { type: "error"; error: string };
+
+export interface ChatStreamCallbacks {
+  onEvent: (event: ChatStreamEvent) => void | Promise<void>;
+}
+
 export interface StoredDocumentInput {
   title: string;
   content: string;

@@ -67,6 +67,71 @@ export class OpenAiCompatibleClient {
     return content;
   }
 
+  async *streamChat(params: {
+    messages: ChatMessage[];
+    model?: string;
+    temperature?: number;
+  }): AsyncGenerator<string> {
+    const model = params.model ?? this.config.chatModel;
+    if (!this.canChat(model)) {
+      throw new Error("Chat service is not configured. Set AI_API_KEY and AI_CHAT_MODEL/AI_ROUTER_MODEL in .env.");
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+
+    try {
+      const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${this.config.apiKey}`
+        },
+        body: JSON.stringify({
+          model,
+          messages: params.messages,
+          temperature: params.temperature ?? 0.2,
+          stream: true
+        }),
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`AI stream request failed with ${response.status}: ${detail}`);
+      }
+
+      if (!response.body) {
+        throw new Error("AI stream response has no body.");
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of response.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const content = parseStreamLine(line);
+          if (content) {
+            yield content;
+          }
+        }
+      }
+
+      buffer += decoder.decode();
+      for (const line of buffer.split(/\r?\n/)) {
+        const content = parseStreamLine(line);
+        if (content) {
+          yield content;
+        }
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
@@ -94,10 +159,31 @@ export class OpenAiCompatibleClient {
   }
 }
 
+function parseStreamLine(line: string): string | undefined {
+  if (!line.startsWith("data:")) {
+    return undefined;
+  }
+
+  const data = line.slice("data:".length).trim();
+  if (!data || data === "[DONE]") {
+    return undefined;
+  }
+
+  const json = JSON.parse(data) as ChatStreamResponse;
+  return json.choices?.[0]?.delta?.content || json.choices?.[0]?.message?.content;
+}
+
 interface EmbeddingResponse {
   data: Array<{ embedding: number[] }>;
 }
 
 interface ChatResponse {
   choices: Array<{ message: { content: string } }>;
+}
+
+interface ChatStreamResponse {
+  choices: Array<{
+    delta?: { content?: string };
+    message?: { content?: string };
+  }>;
 }
