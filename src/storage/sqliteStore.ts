@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { RequestContext, RoutePlan, StoredChunk, StoredDocument, StoredDocumentInput } from "../types.js";
+import type { EvidenceItem, RequestContext, RoutePlan, StoredChunk, StoredDocument, StoredDocumentInput } from "../types.js";
 
 export class SqliteStore {
   private readonly db: DatabaseSync;
@@ -90,6 +90,47 @@ export class SqliteStore {
       .prepare("SELECT * FROM documents ORDER BY created_at DESC LIMIT ?")
       .all(limit) as unknown as DocumentRow[];
     return rows.map(mapDocument);
+  }
+
+
+  searchChunks(params: { query: string; projectId: string; limit?: number }): EvidenceItem[] {
+    const limit = params.limit ?? 6;
+    const trimmed = params.query.trim();
+    const terms = trimmed.split(/\s+/).filter(Boolean).slice(0, 6);
+
+    if (terms.length === 0 || /^(最近|最新|recent|list|列出|全部)$/iu.test(trimmed)) {
+      return this.listRecentChunkEvidence(params.projectId, limit);
+    }
+
+    const pattern = `%${escapeLike(trimmed)}%`;
+    const rows = this.db
+      .prepare(
+        `SELECT c.*, d.title, d.source, d.project_id
+         FROM chunks c
+         JOIN documents d ON d.id = c.document_id
+         WHERE d.project_id = ?
+           AND (d.title LIKE ? ESCAPE '\\' OR d.source LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\')
+         ORDER BY d.created_at DESC, c.chunk_index ASC
+         LIMIT ?`
+      )
+      .all(params.projectId, pattern, pattern, pattern, limit) as unknown as ChunkJoinRow[];
+
+    return rows.map((row) => mapChunkEvidence(row, keywordScore(row, terms)));
+  }
+
+  listRecentChunkEvidence(projectId: string, limit = 6): EvidenceItem[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.*, d.title, d.source, d.project_id
+         FROM chunks c
+         JOIN documents d ON d.id = c.document_id
+         WHERE d.project_id = ?
+         ORDER BY d.created_at DESC, c.chunk_index ASC
+         LIMIT ?`
+      )
+      .all(projectId, limit) as unknown as ChunkJoinRow[];
+
+    return rows.map((row, index) => mapChunkEvidence(row, index));
   }
 
   insertMessage(params: {
@@ -215,6 +256,29 @@ function mapDocument(row: DocumentRow): StoredDocument {
     metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
     createdAt: row.created_at
   };
+}
+
+function mapChunkEvidence(row: ChunkJoinRow, score: number): EvidenceItem {
+  return {
+    chunkId: row.id,
+    documentId: row.document_id,
+    projectId: row.project_id,
+    title: row.title,
+    source: row.source ?? undefined,
+    content: row.content,
+    score
+  };
+}
+
+function keywordScore(row: ChunkJoinRow, terms: string[]): number {
+  const haystack = `${row.title}
+${row.source ?? ""}
+${row.content}`.toLowerCase();
+  return terms.reduce((score, term) => score + (haystack.includes(term.toLowerCase()) ? 1 : 0), 0);
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
 }
 
 function estimateTokens(text: string): number {

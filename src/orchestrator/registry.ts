@@ -1,6 +1,25 @@
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import type { CapabilityDefinition } from "../types.js";
 
-export const capabilities: CapabilityDefinition[] = [
+interface SkillRegistryEntry {
+  name: string;
+  path: string;
+  capabilityId?: string;
+  kind?: "skill" | "workflow";
+  examples?: string[];
+  requiredParams?: string[];
+  optionalParams?: string[];
+  riskLevel?: "low" | "medium" | "high";
+  costLevel?: "low" | "medium" | "high";
+  requiresConfirmation?: boolean;
+}
+
+interface SkillRegistryFile {
+  skills?: SkillRegistryEntry[];
+}
+
+export const builtInCapabilities: CapabilityDefinition[] = [
   {
     id: "workflow.ingest_wechat_article",
     kind: "workflow",
@@ -24,17 +43,121 @@ export const capabilities: CapabilityDefinition[] = [
     riskLevel: "low",
     costLevel: "low",
     requiresConfirmation: false
-  },
-  {
-    id: "skill.query_database",
-    kind: "skill",
-    name: "查询数据库",
-    description: "对用户问题生成云端 embedding，在本地 LanceDB 召回资料片段，并结合 SQLite 元数据返回证据。",
-    examples: ["查询数据库：Orchestrator 的边界是什么？", "从知识库里找 Router 的职责", "根据资料回答这个问题"],
-    requiredParams: ["query"],
-    optionalParams: ["projectId", "limit"],
-    riskLevel: "low",
-    costLevel: "low",
-    requiresConfirmation: false
   }
 ];
+
+export function loadCapabilities(rootDir = process.cwd()): CapabilityDefinition[] {
+  const skillCapabilities = loadSkillCapabilities(path.resolve(rootDir, "skills", "registry.json"));
+  const capabilitiesById = new Map<string, CapabilityDefinition>();
+  for (const capability of [...builtInCapabilities, ...skillCapabilities]) {
+    capabilitiesById.set(capability.id, capability);
+  }
+  return Array.from(capabilitiesById.values());
+}
+
+export const capabilities: CapabilityDefinition[] = loadCapabilities();
+
+function loadSkillCapabilities(registryPath: string): CapabilityDefinition[] {
+  if (!existsSync(registryPath)) {
+    return defaultQuerySkillCapabilities();
+  }
+
+  try {
+    const registry = JSON.parse(readFileSync(registryPath, "utf8")) as SkillRegistryFile;
+    const baseDir = path.dirname(registryPath);
+    const capabilities = (registry.skills ?? [])
+      .map((entry) => toCapability(entry, baseDir))
+      .filter((capability): capability is CapabilityDefinition => Boolean(capability));
+    return capabilities.length > 0 ? capabilities : defaultQuerySkillCapabilities();
+  } catch {
+    return defaultQuerySkillCapabilities();
+  }
+}
+
+function toCapability(entry: SkillRegistryEntry, baseDir: string): CapabilityDefinition | undefined {
+  const skillPath = path.resolve(baseDir, entry.path);
+  const skillMd = path.join(skillPath, "SKILL.md");
+  if (!existsSync(skillMd)) {
+    return undefined;
+  }
+
+  const frontmatter = parseSkillFrontmatter(readFileSync(skillMd, "utf8"));
+  if (!frontmatter.name || !frontmatter.description) {
+    return undefined;
+  }
+
+  const capabilityId = entry.capabilityId ?? `skill.${frontmatter.name.replace(/-/g, "_")}`;
+  return {
+    id: capabilityId,
+    kind: entry.kind ?? "skill",
+    name: frontmatter.name,
+    description: frontmatter.description,
+    examples: entry.examples ?? [],
+    requiredParams: entry.requiredParams ?? ["query"],
+    optionalParams: entry.optionalParams ?? ["projectId", "limit"],
+    riskLevel: entry.riskLevel ?? "low",
+    costLevel: entry.costLevel ?? "low",
+    requiresConfirmation: entry.requiresConfirmation ?? false
+  };
+}
+
+function parseSkillFrontmatter(markdown: string): { name?: string; description?: string } {
+  const block = markdown.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? markdown.match(/^---\s+([\s\S]*?)\s+---/)?.[1];
+  if (!block) {
+    return {};
+  }
+
+  const result: { name?: string; description?: string } = {};
+  for (const line of block.split(/\r?\n/)) {
+    const index = line.indexOf(":");
+    if (index === -1) {
+      continue;
+    }
+    const key = line.slice(0, index).trim();
+    const value = line.slice(index + 1).trim().replace(/^[ '"]|[ '"]$/g, "");
+    if (key === "name" || key === "description") {
+      result[key] = value;
+    }
+  }
+
+  const parsedName = block.match(/(?:^|\s)name:\s*([^\s]+)/)?.[1];
+  if (!result.name || result.name.includes(":")) {
+    result.name = parsedName;
+  }
+  result.description ??= block
+    .match(/(?:^|\s)description:\s*([\s\S]*?)(?:\s+(?:license|allowed-tools|metadata):|$)/)?.[1]
+    ?.trim();
+  return result;
+}
+
+
+function defaultQuerySkillCapabilities(): CapabilityDefinition[] {
+  return [
+    {
+      id: "skill.lancedb_query",
+      kind: "skill",
+      name: "lancedb-query",
+      description:
+        "Semantic vector retrieval over LanceDB document chunks. Use when the user asks to query/search the knowledge base by meaning, find similar passages, perform RAG retrieval, or asks for LanceDB/vector/embedding search.",
+      examples: ["查询知识库：Router 的职责是什么？", "用 LanceDB 语义检索 orchestrator", "从资料中找相似片段"],
+      requiredParams: ["query"],
+      optionalParams: ["projectId", "limit"],
+      riskLevel: "low",
+      costLevel: "low",
+      requiresConfirmation: false
+    },
+    {
+      id: "skill.sqlite_query",
+      kind: "skill",
+      name: "sqlite-query",
+      description:
+        "Structured and keyword lookup over local SQLite tables for documents, chunks, route logs, and conversation metadata. Use when the user asks for SQLite/database metadata, exact keyword/title/source lookup, recent documents, route logs, counts, or SQL-style inspection.",
+      examples: ["查 SQLite 最近写入的文档", "按标题在数据库里找架构原则", "列出 route_logs 最近记录"],
+      requiredParams: ["query"],
+      optionalParams: ["projectId", "limit"],
+      riskLevel: "low",
+      costLevel: "low",
+      requiresConfirmation: false
+    }
+  ];
+}

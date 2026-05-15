@@ -227,7 +227,8 @@ export class Orchestrator {
     return this.documents.search({
       query,
       projectId: context.projectId,
-      limit: 6
+      limit: 6,
+      skillId: selectRetrievalSkill(routePlan)
     });
   }
 
@@ -354,6 +355,13 @@ function createRequestContext(
     message: input.message,
     createdAt: new Date().toISOString()
   };
+}
+
+function selectRetrievalSkill(routePlan: RoutePlan): string {
+  if (routePlan.candidateCapabilities.includes("skill.sqlite_query")) {
+    return "skill.sqlite_query";
+  }
+  return "skill.lancedb_query";
 }
 
 function stringParam(value: unknown): string | undefined {

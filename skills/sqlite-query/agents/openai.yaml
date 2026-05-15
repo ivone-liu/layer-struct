@@ -1,0 +1,3 @@
+display_name: SQLite Query
+short_description: Keyword and metadata lookup over local SQLite tables.
+default_prompt: Query local SQLite metadata and exact document matches.

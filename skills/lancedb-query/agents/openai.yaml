@@ -1,0 +1,3 @@
+display_name: LanceDB Query
+short_description: Semantic vector retrieval from LanceDB chunks.
+default_prompt: Query the knowledge base with LanceDB semantic retrieval.

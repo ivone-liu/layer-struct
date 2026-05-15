@@ -96,3 +96,33 @@ pip install wespy
 - 环境与启动：[doc/environment.md](doc/environment.md)
 - 技术实现方案：[doc/TECHNICAL_IMPLEMENTATION_PLAN.md](doc/TECHNICAL_IMPLEMENTATION_PLAN.md)
 - 架构对齐 Review：[doc/ARCHITECTURE_ALIGNMENT_REVIEW.md](doc/ARCHITECTURE_ALIGNMENT_REVIEW.md)
+
+## Skill 查询能力
+
+项目内置了两个按标准 Skill 目录组织的查询能力，并通过 `skills/registry.json` 注册。Router 在需要查询时会根据意图自动选择并加载对应 capability：
+
+- `skill.lancedb_query`：位于 `skills/lancedb-query`，用于 LanceDB 向量/语义检索、RAG 召回和相似片段查询。
+- `skill.sqlite_query`：位于 `skills/sqlite-query`，用于 SQLite 精确关键词、标题/来源、最近文档和元数据类查询。
+
+手动查询示例：
+
+```bash
+# 语义检索，默认走 LanceDB skill
+curl -X POST http://localhost:3000/api/search \
+  -H 'content-type: application/json' \
+  -d '{"query":"Router 的职责是什么？","projectId":"default","skillId":"skill.lancedb_query"}'
+
+# 精确/元数据查询，走 SQLite skill
+curl -X POST http://localhost:3000/api/search \
+  -H 'content-type: application/json' \
+  -d '{"query":"最近","projectId":"default","skillId":"skill.sqlite_query"}'
+```
+
+安装自定义 Skill 并更新注册表：
+
+```bash
+npm run skills:install -- /path/to/my-skill
+npm run skills:install -- https://github.com/anthropics/skills/tree/main/skills/pdf
+```
+
+安装脚本会复制包含 `SKILL.md` 的目录到 `skills/<skill-name>`，并更新 `skills/registry.json`。应用启动时读取该注册表，把已安装 Skill 暴露给 Router 的能力列表。

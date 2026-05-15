@@ -50,7 +50,15 @@ export class DocumentService {
     return { document, chunkCount: chunks.length };
   }
 
-  async search(params: { query: string; projectId: string; limit?: number }): Promise<EvidencePack> {
+  async search(params: { query: string; projectId: string; limit?: number; skillId?: string }): Promise<EvidencePack> {
+    if (params.skillId === "skill.sqlite_query") {
+      return this.searchSqlite(params);
+    }
+
+    return this.searchLanceDb(params);
+  }
+
+  async searchLanceDb(params: { query: string; projectId: string; limit?: number }): Promise<EvidencePack> {
     const vector = await this.ai.embed(params.query);
     const items = await this.vectors.search({
       vector,
@@ -60,7 +68,16 @@ export class DocumentService {
 
     return {
       query: params.query,
+      skillId: "skill.lancedb_query",
       items
+    };
+  }
+
+  async searchSqlite(params: { query: string; projectId: string; limit?: number }): Promise<EvidencePack> {
+    return {
+      query: params.query,
+      skillId: "skill.sqlite_query",
+      items: this.sqlite.searchChunks(params)
     };
   }
 }
