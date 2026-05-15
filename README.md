@@ -143,3 +143,7 @@ npm run skills:install -- https://github.com/anthropics/skills/tree/main/skills/
 ```
 
 安装脚本会复制包含 `SKILL.md` 的目录到 `skills/<skill-name>`，并更新 `skills/registry.json`。如果自定义 Skill 已经位于目标目录（例如 `./skills/pdf` 且 Skill 名称为 `pdf`），脚本会保留该目录并只刷新注册表，避免先删除源目录再复制导致 `ENOENT`。应用启动时读取该注册表，把已安装 Skill 暴露给 Router 的能力列表。
+
+注册新 Skill 时，安装脚本会按 Anthropic《The Complete Guide to Building Skills for Claude》的核心格式要求做本地校验：`SKILL.md` 必须大小写完全匹配、包含 YAML frontmatter，`name` 必须是 kebab-case 且与注册目录一致，`description` 必须说明“做什么”和“何时使用”、长度小于 1024 字符且 frontmatter 不包含 XML 尖括号；Skill 目录内不能放 `README.md`，额外资料应放在 `SKILL.md` 或 `references/`。校验通过后，脚本会调用 OpenAI-compatible 大模型为该 Skill 生成确定结构的注册表基础信息，包括 `examples`、`requiredParams`、`optionalParams`、风险/成本等级和是否需要确认。模型调用使用 `temperature: 0`、`response_format: {"type":"json_object"}`，并在写入注册表前对 JSON 字段做归一化校验，方便 Router 后续稳定选择和调用。
+
+Skill 注册元数据生成依赖以下环境变量：`AI_API_KEY`（或 `OPENAI_API_KEY`）、`AI_SKILL_REGISTRY_MODEL`（优先；也可回退到 `AI_ROUTER_MODEL`、`AI_CHAT_MODEL` 或 `OPENAI_MODEL`），以及可选的 `AI_BASE_URL`（或 `OPENAI_BASE_URL`，默认 `https://api.openai.com/v1`）和 `AI_SKILL_REGISTRY_TIMEOUT_MS`（默认回退到 `AI_REQUEST_TIMEOUT_MS` 或 60000）。如果未配置 API key 或模型，安装脚本会拒绝注册并提示缺失配置。
