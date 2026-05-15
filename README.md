@@ -138,7 +138,8 @@ curl -X POST http://localhost:3000/api/search \
 
 ```bash
 npm run skills:install -- /path/to/my-skill
+npm run skills:install -- ./skills/pdf
 npm run skills:install -- https://github.com/anthropics/skills/tree/main/skills/pdf
 ```
 
-安装脚本会复制包含 `SKILL.md` 的目录到 `skills/<skill-name>`，并更新 `skills/registry.json`。应用启动时读取该注册表，把已安装 Skill 暴露给 Router 的能力列表。
+安装脚本会复制包含 `SKILL.md` 的目录到 `skills/<skill-name>`，并更新 `skills/registry.json`。如果自定义 Skill 已经位于目标目录（例如 `./skills/pdf` 且 Skill 名称为 `pdf`），脚本会保留该目录并只刷新注册表，避免先删除源目录再复制导致 `ENOENT`。应用启动时读取该注册表，把已安装 Skill 暴露给 Router 的能力列表。
