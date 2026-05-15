@@ -69,7 +69,7 @@ export class LanceVectorStore {
 
   private async connect(): Promise<LanceDatabase> {
     const lancedb = await import("@lancedb/lancedb");
-    return lancedb.connect(this.uri) as Promise<LanceDatabase>;
+    return lancedb.connect(this.uri) as unknown as Promise<LanceDatabase>;
   }
 
   private async openTable(db: LanceDatabase): Promise<LanceTable | undefined> {

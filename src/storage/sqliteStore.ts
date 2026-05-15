@@ -88,7 +88,7 @@ export class SqliteStore {
   listRecentDocuments(limit = 20): StoredDocument[] {
     const rows = this.db
       .prepare("SELECT * FROM documents ORDER BY created_at DESC LIMIT ?")
-      .all(limit) as DocumentRow[];
+      .all(limit) as unknown as DocumentRow[];
     return rows.map(mapDocument);
   }
 

@@ -10,6 +10,11 @@ export interface AppConfig {
   lanceDbUri: string;
   lanceDbTable: string;
   defaultProjectId: string;
+  wespy: {
+    command: string;
+    outputDir: string;
+    timeoutMs: number;
+  };
   ai: {
     baseUrl: string;
     apiKey: string;
@@ -68,6 +73,11 @@ export function loadConfig(): AppConfig {
     lanceDbUri: readString("LANCEDB_URI", path.join(dataDir, "lancedb")),
     lanceDbTable: readString("LANCEDB_TABLE", "document_chunks"),
     defaultProjectId: readString("DEFAULT_PROJECT_ID", "default"),
+    wespy: {
+      command: readString("WESPY_COMMAND", "wespy"),
+      outputDir: readString("WESPY_OUTPUT_DIR", path.join(dataDir, "wespy")),
+      timeoutMs: readNumber("WESPY_TIMEOUT_MS", 120000)
+    },
     ai: {
       baseUrl: readString("AI_BASE_URL", "https://api.openai.com/v1").replace(/\/$/, ""),
       apiKey: readString("AI_API_KEY"),
