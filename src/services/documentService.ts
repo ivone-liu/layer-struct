@@ -2,13 +2,17 @@ import { randomUUID } from "node:crypto";
 import type { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
 import { LanceVectorStore } from "../storage/lanceVectorStore.js";
 import { SqliteStore } from "../storage/sqliteStore.js";
-import type { DocumentWriteProgressEvent, EvidencePack, StoredDocument, StoredDocumentInput } from "../types.js";
+import type { AppConfig } from "../config/env.js";
+import type { MemoryService } from "./memoryService.js";
+import type { DocumentCandidate, DocumentWriteProgressEvent, EvidencePack, MemoryHit, StoredDocument, StoredDocumentInput } from "../types.js";
 
 export class DocumentService {
   constructor(
     private readonly sqlite: SqliteStore,
     private readonly vectors: LanceVectorStore,
-    private readonly ai: OpenAiCompatibleClient
+    private readonly ai: OpenAiCompatibleClient,
+    private readonly config?: AppConfig,
+    private readonly memory?: MemoryService
   ) {}
 
   async writeDocument(
@@ -52,6 +56,7 @@ export class DocumentService {
         title: input.title,
         source: input.source ?? "",
         text: chunk.content,
+        chunkIndex: chunk.chunkIndex,
         vector
       });
 
@@ -82,34 +87,56 @@ export class DocumentService {
       limit: params.limit
     });
 
-    return {
+    return this.expandEvidencePack({
       query: params.query,
       skillId: "skill.lancedb_query",
-      items
-    };
+      items,
+      retrievalSources: ["document_chunks"]
+    });
   }
 
   async searchSqlite(params: { query: string; projectId: string; limit?: number }): Promise<EvidencePack> {
-    return {
+    return this.expandEvidencePack({
       query: params.query,
       skillId: "skill.sqlite_query",
-      items: this.sqlite.searchChunks(params)
-    };
+      items: this.sqlite.searchChunks(params),
+      retrievalSources: ["sqlite_chunks"]
+    });
   }
 
   async searchDocumentChunks(params: { documentId: string; query: string; limit?: number }): Promise<EvidencePack> {
-    return {
+    return this.expandEvidencePack({
       query: params.query,
       skillId: "skill.sqlite_query",
-      items: this.sqlite.searchDocumentChunks(params)
-    };
+      items: this.sqlite.searchDocumentChunks(params),
+      retrievalSources: ["sqlite_document_chunks"]
+    });
   }
 
   async listDocumentChunks(params: { documentId: string; limit?: number }): Promise<EvidencePack> {
-    return {
+    return this.expandEvidencePack({
       query: `document:${params.documentId}`,
       skillId: "skill.sqlite_query",
-      items: this.sqlite.listDocumentChunks(params)
+      items: this.sqlite.listDocumentChunks(params),
+      retrievalSources: ["sqlite_document_chunks"]
+    });
+  }
+
+  searchDocuments(params: { query: string; projectId: string; limit?: number }): DocumentCandidate[] {
+    return this.sqlite.searchDocuments(params);
+  }
+
+  async searchMemory(params: { query: string; projectId: string; userId?: string; limit?: number }): Promise<MemoryHit[]> {
+    return this.memory?.search(params) ?? [];
+  }
+
+  async expandEvidencePack(evidencePack: EvidencePack, window = this.config?.evidenceContextWindow ?? 1): Promise<EvidencePack> {
+    if (evidencePack.expandedItems) {
+      return evidencePack;
+    }
+    return {
+      ...evidencePack,
+      expandedItems: this.sqlite.expandEvidenceItems(evidencePack.items, window)
     };
   }
 }

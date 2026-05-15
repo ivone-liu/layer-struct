@@ -8,6 +8,7 @@ import type {
   ExecutionResult,
   EvidenceItem,
   EvidencePack,
+  MemoryHit,
   RequestContext,
   RoutePlan,
   SkillExecutionResult,
@@ -25,22 +26,30 @@ import { SkillPlanner } from "./skillPlanner.js";
 import { SkillExecutor } from "./skillExecutor.js";
 import { observeSkillResults } from "./skillObserver.js";
 import { capabilities } from "./registry.js";
+import { MemoryService } from "../services/memoryService.js";
+import { ParallelRetriever } from "./parallelRetriever.js";
+import { DocumentResolver } from "./documentResolver.js";
 
 export class Orchestrator {
   private readonly router: Router;
   private readonly wechatArticles: WeChatArticleWorkflow;
   private readonly skillPlanner = new SkillPlanner();
   private readonly skillExecutor: SkillExecutor;
+  private readonly parallelRetriever: ParallelRetriever;
+  private readonly documentResolver: DocumentResolver;
 
   constructor(
     private readonly config: AppConfig,
     private readonly sqlite: SqliteStore,
     private readonly documents: DocumentService,
-    private readonly ai: OpenAiCompatibleClient
+    private readonly ai: OpenAiCompatibleClient,
+    private readonly memory: MemoryService
   ) {
     this.router = new Router(ai, config.ai.routerModel);
     this.wechatArticles = new WeChatArticleWorkflow(config.wespy);
     this.skillExecutor = new SkillExecutor(documents);
+    this.parallelRetriever = new ParallelRetriever(memory, documents);
+    this.documentResolver = new DocumentResolver(sqlite);
   }
 
   async chat(input: { message: string; sessionId?: string; userId?: string; projectId?: string }): Promise<ChatResponse> {
@@ -50,18 +59,28 @@ export class Orchestrator {
     const sessionState = this.sqlite.getSessionState(context.sessionId);
     const routePlan = await this.router.route(context);
     this.sqlite.insertRouteLog(context, routePlan);
-    const skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities);
+    const hints = await this.parallelRetriever.searchHints(context, routePlan);
+    const memoryHits = hints.memoryHits;
+    const documentResolution = this.documentResolver.resolve({ context, routePlan, sessionState, memoryHits, documentCandidates: hints.documentCandidates });
+    routePlan.documentResolution = documentResolution;
+    if (documentResolution.status === "ambiguous") {
+      const answer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
+      this.insertAssistantMessage(context.sessionId, answer);
+      return { answer, routePlan, memoryHits };
+    }
+    const skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities, documentResolution, memoryHits);
     routePlan.skillPlan = skillPlan;
     routePlan.answerStrategy = skillPlan.answerStrategy;
     routePlan.requiresEvidence = skillPlan.requiresEvidence;
 
-    const executionResult = await this.executeIfNeeded(context, routePlan);
-    const { skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan);
+    const executionResult = await this.executeIfNeeded(context, routePlan, undefined, context.userId);
+    let { skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan);
+    evidencePack = evidencePack ? await this.documents.expandEvidencePack({ ...evidencePack, memoryHits, retrievalSources: [...(evidencePack.retrievalSources ?? []), "memory_items"] }) : undefined;
     const guardAnswer = guardedNoEvidenceAnswer(skillPlan, observation);
-    const answer = guardAnswer ?? (await this.generateAnswer(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation));
+    const answer = guardAnswer ?? (await this.generateAnswer(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits));
 
     this.insertAssistantMessage(context.sessionId, answer);
-    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation };
+    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits };
   }
 
   async chatStream(
@@ -90,6 +109,7 @@ export class Orchestrator {
     let executionResult: ExecutionResult | undefined;
     let evidencePack: EvidencePack | undefined;
     let finalAnswer = "";
+    let memoryHits: MemoryHit[] = [];
     let completedWithFallback = false;
 
     try {
@@ -104,15 +124,34 @@ export class Orchestrator {
       await tracker.stepStarted("router", "正在判断这是普通对话、资料查询还是工作流任务。");
       routePlan = await this.router.route(context);
       this.sqlite.insertRouteLog(context, routePlan);
-      skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities);
+      await tracker.stepCompleted("router", renderRouteMessage(routePlan), { routePlan, sessionState });
+      callbacks.onEvent({ type: "memory_started", runId, visibleMessage: "正在查找跨对话记忆。" });
+      const hints = await this.parallelRetriever.searchHints(context, routePlan);
+      memoryHits = hints.memoryHits;
+      callbacks.onEvent({ type: "memory_completed", runId, visibleMessage: `已找到 ${memoryHits.length} 条相关记忆。`, memoryHits });
+      const documentResolution = this.documentResolver.resolve({ context, routePlan, sessionState, memoryHits, documentCandidates: hints.documentCandidates });
+      routePlan.documentResolution = documentResolution;
+      if (documentResolution.status === "ambiguous") {
+        callbacks.onEvent({ type: "document_ambiguous", runId, visibleMessage: "找到多篇候选文档，需要选择。", documentResolution });
+        finalAnswer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
+        await tracker.answerDelta(finalAnswer);
+        this.insertAssistantMessage(context.sessionId, finalAnswer);
+        const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits };
+        await tracker.done(result, "completed");
+        return result;
+      }
+      if (documentResolution.status === "resolved") {
+        callbacks.onEvent({ type: "document_resolved", runId, visibleMessage: `已定位到《${documentResolution.title ?? documentResolution.documentId}》。`, documentResolution });
+      }
+      skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities, documentResolution, memoryHits);
       routePlan.skillPlan = skillPlan;
       routePlan.answerStrategy = skillPlan.answerStrategy;
       routePlan.requiresEvidence = skillPlan.requiresEvidence;
-      await tracker.stepCompleted("router", renderRouteMessage(routePlan), { routePlan, sessionState });
       await tracker.skillPlan(skillPlan, renderSkillPlanMessage(skillPlan));
 
-      executionResult = await this.executeIfNeeded(context, routePlan, tracker);
+      executionResult = await this.executeIfNeeded(context, routePlan, tracker, context.userId);
       ({ skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan, tracker));
+      evidencePack = evidencePack ? await this.documents.expandEvidencePack({ ...evidencePack, memoryHits, retrievalSources: [...(evidencePack.retrievalSources ?? []), "memory_items"] }) : undefined;
 
       const guardAnswer = guardedNoEvidenceAnswer(skillPlan, observation);
       if (guardAnswer) {
@@ -122,7 +161,7 @@ export class Orchestrator {
       } else {
         await tracker.observation(observation, "证据足够，开始生成回答。");
         await tracker.stepStarted("context", "正在整理证据和上下文。");
-        const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation);
+        const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
         await tracker.stepCompleted("context", "上下文已整理完成。", {
           hasEvidence: Boolean(evidencePack),
           evidenceCount: evidencePack?.items.length ?? 0,
@@ -130,7 +169,7 @@ export class Orchestrator {
           skillResultCount: skillResults.length
         });
 
-        await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation });
+        await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits });
         await tracker.stepStarted("generation", "正在生成最终回答。");
         let usedFallback = false;
         try {
@@ -159,7 +198,7 @@ export class Orchestrator {
       }
 
       this.insertAssistantMessage(context.sessionId, finalAnswer);
-      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation };
+      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits };
       await tracker.done(result, completedWithFallback ? "completed_with_fallback" : "completed");
       return result;
     } catch (error) {
@@ -170,10 +209,17 @@ export class Orchestrator {
 
   async writeDocument(input: StoredDocumentInput): Promise<ExecutionResult> {
     const result = await this.documents.writeDocument(input);
+    await this.memory.createDocumentAnchorMemory({
+      projectId: result.document.projectId,
+      documentId: result.document.id,
+      title: result.document.title,
+      source: result.document.source,
+      contentSample: result.document.content.slice(0, 1600)
+    });
     return {
       status: "success",
       capabilityId: "workflow.ingest_text_database",
-      message: "文档已写入 SQLite 与 LanceDB。",
+      message: "文档已写入 SQLite、LanceDB，并创建 document_anchor memory。",
       output: { documentId: result.document.id, title: result.document.title, chunkCount: result.chunkCount }
     };
   }
@@ -207,7 +253,7 @@ export class Orchestrator {
     return { skillResults, observation, evidencePack };
   }
 
-  private async executeIfNeeded(context: RequestContext, routePlan: RoutePlan, tracker?: RunTracker): Promise<ExecutionResult | undefined> {
+  private async executeIfNeeded(context: RequestContext, routePlan: RoutePlan, tracker?: RunTracker, userId?: string): Promise<ExecutionResult | undefined> {
     if (!routePlan.needsWorkflow && routePlan.taskType !== "workflow") {
       return undefined;
     }
@@ -215,7 +261,7 @@ export class Orchestrator {
     const wechatUrl = stringParam(routePlan.extractedParams.url) || extractWeChatArticleUrl(context.message);
     if (wechatUrl && routePlan.candidateCapabilities.includes("workflow.ingest_wechat_article")) {
       await tracker?.stepStarted("execution", "正在抓取公众号文章内容。", { capabilityId: "workflow.ingest_wechat_article" });
-      const result = await this.ingestWeChatArticle(context, wechatUrl, tracker);
+      const result = await this.ingestWeChatArticle(context, wechatUrl, tracker, userId);
       if (result.status === "failed") {
         await tracker?.stepFailed("execution", "公众号文章写入数据库失败。", result.error ?? result.message, { result });
       } else {
@@ -246,13 +292,15 @@ export class Orchestrator {
         metadata: { requestId: context.requestId, sessionId: context.sessionId }
       },
       context.sessionId,
-      tracker
+      tracker,
+      "workflow.ingest_text_database",
+      userId
     );
     await tracker?.stepCompleted("execution", "资料已写入知识库。", { result });
     return result;
   }
 
-  private async ingestWeChatArticle(context: RequestContext, url: string, tracker?: RunTracker): Promise<ExecutionResult> {
+  private async ingestWeChatArticle(context: RequestContext, url: string, tracker?: RunTracker, userId?: string): Promise<ExecutionResult> {
     try {
       const article = await this.wechatArticles.fetchArticle(url);
       await tracker?.metadata({ progress: { type: "wechat_article_fetched", url, title: article.title } }, "文章内容已获取，正在写入知识库。");
@@ -275,7 +323,8 @@ export class Orchestrator {
         },
         context.sessionId,
         tracker,
-        "workflow.ingest_wechat_article"
+        "workflow.ingest_wechat_article",
+        userId
       );
 
       return {
@@ -293,7 +342,8 @@ export class Orchestrator {
     input: StoredDocumentInput,
     sessionId: string,
     tracker?: RunTracker,
-    capabilityId = "workflow.ingest_text_database"
+    capabilityId = "workflow.ingest_text_database",
+    userId?: string
   ): Promise<ExecutionResult> {
     const result = await this.documents.writeDocument(input, async (event) => {
       await tracker?.metadata({ progress: event }, documentProgressMessage(event));
@@ -303,6 +353,15 @@ export class Orchestrator {
       currentDocumentId: result.document.id,
       currentDocumentTitle: result.document.title,
       currentDocumentSource: result.document.source
+    });
+    await this.memory.createDocumentAnchorMemory({
+      userId,
+      projectId: result.document.projectId,
+      sessionId,
+      documentId: result.document.id,
+      title: result.document.title,
+      source: result.document.source,
+      contentSample: result.document.content.slice(0, 1600)
     });
     return {
       status: "success",
@@ -319,9 +378,10 @@ export class Orchestrator {
     evidencePack?: EvidencePack,
     skillPlan?: SkillPlan,
     skillResults?: SkillExecutionResult[],
-    observation?: SkillObservation
+    observation?: SkillObservation,
+    memoryHits: MemoryHit[] = []
   ): Promise<string> {
-    const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation);
+    const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
     if (generationInput.kind === "static") {
       return generationInput.answer;
     }
@@ -335,7 +395,8 @@ export class Orchestrator {
     evidencePack?: EvidencePack,
     skillPlan?: SkillPlan,
     skillResults?: SkillExecutionResult[],
-    observation?: SkillObservation
+    observation?: SkillObservation,
+    memoryHits: MemoryHit[] = []
   ): GenerationInput {
     if (executionResult?.capabilityId === "workflow.ingest_text_database" || executionResult?.capabilityId === "workflow.ingest_wechat_article") {
       return { kind: "static", answer: this.renderWorkflowAnswer(executionResult) };
@@ -359,7 +420,8 @@ export class Orchestrator {
       skillResults,
       observation,
       answerStrategy,
-      constraints: defaultConstraints(answerStrategy)
+      constraints: defaultConstraints(answerStrategy),
+      memoryHits
     });
     return { kind: "model", history, prompt };
   }
@@ -472,6 +534,11 @@ function mergeEvidencePacks(skillResults: SkillExecutionResult[]): EvidencePack 
   }
   if (skillResults.length === 0) return undefined;
   return { query: [...new Set(queries)].join(" | "), skillId: [...new Set(skillIds)].join(","), items };
+}
+
+function renderAmbiguousDocumentAnswer(candidates: Array<{ documentId: string; title: string; source?: string; reason: string }>): string {
+  const lines = candidates.slice(0, 5).map((candidate, index) => `${index + 1}. 《${candidate.title}》 documentId=${candidate.documentId}${candidate.source ? ` source=${candidate.source}` : ""} (${candidate.reason})`);
+  return [`找到多篇候选文档，需要你指定要分析哪一篇：`, ...lines].join("\n");
 }
 
 function documentProgressMessage(event: DocumentWriteProgressEvent): string {

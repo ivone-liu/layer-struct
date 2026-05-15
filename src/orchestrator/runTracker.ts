@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { AiTimeoutError } from "../ai/openAiCompatibleClient.js";
 import { SqliteStore } from "../storage/sqliteStore.js";
-import type { ChatStreamCallbacks, ChatStreamEvent, EvidencePack, ExecutionResult, RoutePlan, RunStepName, SkillCall, SkillExecutionResult, SkillObservation, SkillPlan } from "../types.js";
+import type { ChatStreamCallbacks, ChatStreamEvent, EvidencePack, ExecutionResult, MemoryHit, RoutePlan, RunStepName, SkillCall, SkillExecutionResult, SkillObservation, SkillPlan } from "../types.js";
 
 export class RunTracker {
   private readonly activeStepIds = new Map<RunStepName, string>();
@@ -83,7 +83,8 @@ export class RunTracker {
       executionResult: "executionResult" in payload ? (payload.executionResult as ExecutionResult | undefined) : undefined,
       skillPlan: "skillPlan" in payload ? (payload.skillPlan as SkillPlan | undefined) : undefined,
       skillResults: "skillResults" in payload ? (payload.skillResults as SkillExecutionResult[] | undefined) : undefined,
-      observation: "observation" in payload ? (payload.observation as SkillObservation | undefined) : undefined
+      observation: "observation" in payload ? (payload.observation as SkillObservation | undefined) : undefined,
+      memoryHits: "memoryHits" in payload ? (payload.memoryHits as MemoryHit[] | undefined) : undefined
     });
   }
 
