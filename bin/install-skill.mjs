@@ -12,6 +12,7 @@ if (!source) {
 }
 
 const root = process.cwd();
+loadDotEnv(path.join(root, ".env"));
 const skillsDir = path.join(root, "skills");
 const registryPath = path.join(skillsDir, "registry.json");
 mkdirSync(skillsDir, { recursive: true });
@@ -78,6 +79,37 @@ writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
 cleanup(tempDirs);
 console.log(`Installed skill ${name} into ${path.relative(root, destination)} and updated ${path.relative(root, registryPath)}.`);
 console.log(`Generated registry examples: ${generated.examples.join(" | ")}`);
+
+function loadDotEnv(filePath) {
+  if (!existsSync(filePath)) {
+    return;
+  }
+
+  const raw = readFileSync(filePath, "utf8");
+  for (const line of raw.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const keyValue = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/u);
+    if (!keyValue) {
+      continue;
+    }
+
+    const [, key, rawValue] = keyValue;
+    process.env[key] ??= stripDotEnvValue(rawValue);
+  }
+}
+
+function stripDotEnvValue(value) {
+  const trimmed = value.trim();
+  const quote = trimmed[0];
+  if ((quote === "'" || quote === '"') && trimmed.endsWith(quote)) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed.replace(/\s+#.*$/u, "");
+}
 
 function resolveSourceDir(value, tempDirs) {
   if (existsSync(value)) {
