@@ -5,6 +5,7 @@ export type CostLevel = "low" | "medium" | "high";
 export type RunStatus = "running" | "completed" | "failed";
 export type RunStepName = "intake" | "router" | "execution" | "retrieval" | "context" | "generation";
 export type RunStepStatus = "running" | "completed" | "failed";
+export type AnswerStrategy = "direct" | "rag" | "citation" | "workflow" | "multi_step";
 
 export interface RequestContext {
   requestId: string;
@@ -13,6 +14,38 @@ export interface RequestContext {
   projectId: string;
   message: string;
   createdAt: string;
+}
+
+export interface SkillCall {
+  id: string;
+  skillId: string;
+  reason: string;
+  params: Record<string, unknown>;
+  required: boolean;
+}
+
+export interface SkillPlan {
+  answerStrategy: AnswerStrategy;
+  calls: SkillCall[];
+  requiresEvidence: boolean;
+  canAnswerWithoutSkill: boolean;
+  rationale?: string;
+}
+
+export interface SkillExecutionResult {
+  callId: string;
+  skillId: string;
+  status: "success" | "failed" | "empty" | "skipped";
+  evidencePack?: EvidencePack;
+  output?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface SkillObservation {
+  enoughToAnswer: boolean;
+  missing: string[];
+  nextCalls: SkillCall[];
+  rationale?: string;
 }
 
 export interface RoutePlan {
@@ -28,6 +61,12 @@ export interface RoutePlan {
   missingParams: string[];
   confidence: number;
   rationale?: string;
+  answerStrategy?: AnswerStrategy;
+  requiresEvidence?: boolean;
+  targetDocumentId?: string;
+  targetDocumentTitle?: string;
+  resolvedQuery?: string;
+  skillPlan?: SkillPlan;
 }
 
 export interface CapabilityDefinition {
@@ -56,6 +95,7 @@ export interface CapabilityPlan {
 export interface EvidenceItem {
   chunkId: string;
   documentId: string;
+  chunkIndex?: number;
   title: string;
   source?: string;
   content: string;
@@ -77,11 +117,23 @@ export interface ExecutionResult {
   error?: string;
 }
 
+export interface SessionState {
+  sessionId: string;
+  currentDocumentId?: string;
+  currentDocumentTitle?: string;
+  currentDocumentSource?: string;
+  updatedAt: string;
+}
+
 export interface FinalContext {
   request: RequestContext;
   routePlan: RoutePlan;
   evidencePack?: EvidencePack;
   executionResult?: ExecutionResult;
+  skillPlan?: SkillPlan;
+  skillResults?: SkillExecutionResult[];
+  observation?: SkillObservation;
+  answerStrategy?: AnswerStrategy;
   constraints: string[];
 }
 
@@ -90,6 +142,9 @@ export interface ChatResponse {
   routePlan: RoutePlan;
   evidencePack?: EvidencePack;
   executionResult?: ExecutionResult;
+  skillPlan?: SkillPlan;
+  skillResults?: SkillExecutionResult[];
+  observation?: SkillObservation;
 }
 
 export type DocumentWriteProgressEvent =
@@ -126,6 +181,11 @@ export type ChatStreamEvent =
       error: string;
       debug?: Record<string, unknown>;
     }
+  | { type: "skill_plan"; runId: string; visibleMessage: string; skillPlan: SkillPlan }
+  | { type: "skill_started"; runId: string; visibleMessage: string; call: SkillCall }
+  | { type: "skill_completed"; runId: string; visibleMessage: string; result: SkillExecutionResult }
+  | { type: "skill_failed"; runId: string; visibleMessage: string; result: SkillExecutionResult }
+  | { type: "observation"; runId: string; visibleMessage: string; observation: SkillObservation }
   | { type: "assistant_delta"; runId: string; content: string }
   | {
       type: "metadata";
@@ -135,6 +195,9 @@ export type ChatStreamEvent =
       routePlan?: RoutePlan;
       evidencePack?: EvidencePack;
       executionResult?: ExecutionResult;
+      skillPlan?: SkillPlan;
+      skillResults?: SkillExecutionResult[];
+      observation?: SkillObservation;
     }
   | {
       type: "done";
@@ -144,6 +207,9 @@ export type ChatStreamEvent =
       routePlan: RoutePlan;
       evidencePack?: EvidencePack;
       executionResult?: ExecutionResult;
+      skillPlan?: SkillPlan;
+      skillResults?: SkillExecutionResult[];
+      observation?: SkillObservation;
     }
   | { type: "error"; runId?: string; status?: RunStatus; error: string };
 

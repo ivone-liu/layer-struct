@@ -96,6 +96,22 @@ export class DocumentService {
       items: this.sqlite.searchChunks(params)
     };
   }
+
+  async searchDocumentChunks(params: { documentId: string; query: string; limit?: number }): Promise<EvidencePack> {
+    return {
+      query: params.query,
+      skillId: "skill.sqlite_query",
+      items: this.sqlite.searchDocumentChunks(params)
+    };
+  }
+
+  async listDocumentChunks(params: { documentId: string; limit?: number }): Promise<EvidencePack> {
+    return {
+      query: `document:${params.documentId}`,
+      skillId: "skill.sqlite_query",
+      items: this.sqlite.listDocumentChunks(params)
+    };
+  }
 }
 
 export function chunkText(text: string, maxChars = 1200, overlapChars = 160): string[] {

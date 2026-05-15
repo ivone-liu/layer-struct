@@ -43,7 +43,9 @@ function routerSystemPrompt(): string {
 当用户要求保存、记录、入库、写入数据库时，选择 workflow。
 当用户消息中包含 https://mp.weixin.qq.com/ 开头链接，并要求保存/入库/记录公众号文章内容时，选择 workflow.ingest_wechat_article，并提取 url。
 当用户要求查询数据库、知识库、根据资料回答、检索资料时，选择 rag_chat 或 skill_call。语义/相似/RAG/向量检索优先 skill.lancedb_query；SQLite/SQL/元数据/标题/来源/最近/精确关键词查询优先 skill.sqlite_query。
-普通解释、写作、分析且不依赖资料时，选择 chat。
+如果用户实际依赖已保存资料，即使没有说“查询”，也必须标记 needsSkill=true、needsRag=true、requiresEvidence=true，不能默认 chat。包括：原文、引用、具体段落、出处、文中怎么说、哪一段、摘录；这篇文章、上面那篇、刚才保存、刚才写入、最近保存；根据资料、从库里、知识库、数据库、历史记录、已保存内容；帮我总结刚才那篇、提炼刚才那篇、详细展开刚才那篇。
+如果用户要原文/出处/引用/具体段落，answerStrategy 必须是 citation 且 requiresEvidence=true。
+Router 不回答用户，只判断用户真实需求。普通解释、写作、分析且不依赖资料时，选择 chat。
 
 输出 JSON 字段：
 {
@@ -58,7 +60,10 @@ function routerSystemPrompt(): string {
   "extractedParams": object,
   "missingParams": string[],
   "confidence": number,
-  "rationale": string
+  "rationale": string,
+  "answerStrategy": "direct|rag|citation|workflow|multi_step",
+  "requiresEvidence": boolean,
+  "resolvedQuery": string
 }
 
 已注册能力：
@@ -129,6 +134,33 @@ function routeByRules(message: string): RoutePlan {
     );
   }
 
+
+  const implicitEvidenceQuery = extractImplicitEvidenceQuery(message);
+  if (implicitEvidenceQuery) {
+    const skillId = selectQuerySkill(message);
+    const strategy = isCitationRequest(message) ? "citation" : isMultiStepRequest(message) ? "multi_step" : "rag";
+    return normalizeRoutePlan(
+      {
+        taskType: "rag_chat",
+        needsRag: true,
+        needsMemory: false,
+        needsSkill: true,
+        needsWorkflow: false,
+        capabilityQuery: skillId === "skill.sqlite_query" ? "SQLite 精确查询 本地文档 chunks" : "LanceDB 语义检索 知识库 RAG",
+        searchQueries: [implicitEvidenceQuery],
+        candidateCapabilities: [skillId],
+        extractedParams: { query: implicitEvidenceQuery },
+        missingParams: [],
+        confidence: 0.84,
+        rationale: "规则识别到用户真实需求依赖已保存资料或原文证据。",
+        answerStrategy: strategy,
+        requiresEvidence: true,
+        resolvedQuery: implicitEvidenceQuery
+      },
+      message
+    );
+  }
+
   return {
     taskType: "chat",
     needsRag: false,
@@ -160,19 +192,35 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
     candidateCapabilities.push(selectQuerySkill(message));
   }
 
+  const evidenceIntent = hasImplicitEvidenceIntent(message);
+  const answerStrategy = normalizeAnswerStrategy(plan.answerStrategy, message, taskType, evidenceIntent);
+  const needsRag = Boolean(plan.needsRag || taskType === "rag_chat" || evidenceIntent);
+  const needsSkill = Boolean(plan.needsSkill || taskType === "skill_call" || evidenceIntent || needsRag);
+  const requiresEvidence = Boolean(plan.requiresEvidence || evidenceIntent || answerStrategy === "citation");
+
+  if (evidenceIntent && candidateCapabilities.length === 0) {
+    candidateCapabilities.push(selectQuerySkill(message));
+  }
+
   return {
-    taskType,
-    needsRag: Boolean(plan.needsRag || taskType === "rag_chat"),
+    taskType: evidenceIntent && taskType === "chat" ? "rag_chat" : taskType,
+    needsRag,
     needsMemory: Boolean(plan.needsMemory),
-    needsSkill: Boolean(plan.needsSkill || taskType === "skill_call"),
+    needsSkill,
     needsWorkflow: Boolean(plan.needsWorkflow || taskType === "workflow"),
     capabilityQuery: plan.capabilityQuery ?? "",
-    searchQueries: searchQueries.length > 0 ? searchQueries : taskType === "rag_chat" ? [message] : [],
+    searchQueries: searchQueries.length > 0 ? searchQueries : needsRag ? [message] : [],
     candidateCapabilities,
     extractedParams: normalizeExtractedParams(plan.extractedParams, wechatUrl),
     missingParams: Array.isArray(plan.missingParams) ? plan.missingParams : [],
     confidence: clamp(Number(plan.confidence) || 0.5, 0, 1),
-    rationale: plan.rationale
+    rationale: plan.rationale,
+    answerStrategy,
+    requiresEvidence,
+    targetDocumentId: typeof plan.targetDocumentId === "string" ? plan.targetDocumentId : undefined,
+    targetDocumentTitle: typeof plan.targetDocumentTitle === "string" ? plan.targetDocumentTitle : undefined,
+    resolvedQuery: typeof plan.resolvedQuery === "string" && plan.resolvedQuery.trim() ? plan.resolvedQuery.trim() : undefined,
+    skillPlan: plan.skillPlan
   };
 }
 
@@ -230,7 +278,7 @@ export function extractQueryPayload(message: string): string | undefined {
 }
 
 function selectQuerySkill(message: string): string {
-  if (/(sqlite|sql|元数据|metadata|标题|来源|最近|最新|列出|route_logs|conversation_messages|documents|chunks|精确|关键词)/iu.test(message)) {
+  if (/(sqlite|sql|元数据|metadata|标题|来源|最近|最新|列出|route_logs|conversation_messages|documents|chunks|精确|关键词|原文|引用|具体段落|出处|文中怎么说|哪一段|摘录|这句话在哪篇资料|出现过)/iu.test(message)) {
     return "skill.sqlite_query";
   }
   return "skill.lancedb_query";
@@ -242,4 +290,47 @@ function clamp(value: number, min: number, max: number): number {
 
 function hasWriteIntent(message: string): boolean {
   return /(写入数据库|保存到数据库|保存这段|保存|入库|记录到知识库|保存到知识库|公众号文章)/u.test(message);
+}
+
+function extractImplicitEvidenceQuery(message: string): string | undefined {
+  if (!hasImplicitEvidenceIntent(message)) {
+    return undefined;
+  }
+  return message
+    .replace(/^(请你|请|帮我)?\s*/, "")
+    .replace(/^(我想知道|我希望能够|希望|请问)?\s*/, "")
+    .trim();
+}
+
+function hasImplicitEvidenceIntent(message: string): boolean {
+  return (
+    isCitationRequest(message) ||
+    /(这篇文章|上面那篇|刚才保存|刚才写入|最近保存|刚才那篇|根据资料|从库里|知识库|数据库|历史记录|已保存内容|保存的内容|帮我总结刚才那篇|提炼刚才那篇|详细展开刚才那篇|在哪篇资料|哪篇资料里|类似观点的资料|核心观点)/iu.test(message)
+  );
+}
+
+function isCitationRequest(message: string): boolean {
+  return /(原文|引用|具体段落|出处|文中怎么说|哪一段|摘录|这句话在哪篇资料|出现过)/iu.test(message);
+}
+
+function isMultiStepRequest(message: string): boolean {
+  return /(先.+再|多步|分别|对比|综合)/iu.test(message);
+}
+
+function normalizeAnswerStrategy(value: unknown, message: string, taskType: string, evidenceIntent: boolean) {
+  if (taskType === "workflow") {
+    return "workflow" as const;
+  }
+  if (isCitationRequest(message)) {
+    return "citation" as const;
+  }
+  if (isMultiStepRequest(message)) {
+    return "multi_step" as const;
+  }
+  if (evidenceIntent || taskType === "rag_chat" || taskType === "skill_call") {
+    return "rag" as const;
+  }
+  return value === "direct" || value === "rag" || value === "citation" || value === "workflow" || value === "multi_step"
+    ? value
+    : "direct";
 }

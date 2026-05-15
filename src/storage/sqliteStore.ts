@@ -10,7 +10,8 @@ import type {
   RunStepStatus,
   StoredChunk,
   StoredDocument,
-  StoredDocumentInput
+  StoredDocumentInput,
+  SessionState
 } from "../types.js";
 
 export class SqliteStore {
@@ -102,6 +103,38 @@ export class SqliteStore {
     return rows.map(mapDocument);
   }
 
+  getSessionState(sessionId: string): SessionState | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM session_state WHERE session_id = ?")
+      .get(sessionId) as SessionStateRow | undefined;
+    return row ? mapSessionState(row) : undefined;
+  }
+
+  upsertSessionState(params: {
+    sessionId: string;
+    currentDocumentId?: string;
+    currentDocumentTitle?: string;
+    currentDocumentSource?: string;
+    updatedAt?: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_state (session_id, current_document_id, current_document_title, current_document_source, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           current_document_id = excluded.current_document_id,
+           current_document_title = excluded.current_document_title,
+           current_document_source = excluded.current_document_source,
+           updated_at = excluded.updated_at`
+      )
+      .run(
+        params.sessionId,
+        params.currentDocumentId ?? null,
+        params.currentDocumentTitle ?? null,
+        params.currentDocumentSource ?? null,
+        params.updatedAt ?? new Date().toISOString()
+      );
+  }
 
   searchChunks(params: { query: string; projectId: string; limit?: number }): EvidenceItem[] {
     const limit = params.limit ?? 6;
@@ -126,6 +159,47 @@ export class SqliteStore {
       .all(params.projectId, pattern, pattern, pattern, limit) as unknown as ChunkJoinRow[];
 
     return rows.map((row) => mapChunkEvidence(row, keywordScore(row, terms)));
+  }
+
+
+
+  searchDocumentChunks(params: { documentId: string; query: string; limit?: number }): EvidenceItem[] {
+    const limit = params.limit ?? 8;
+    const trimmed = params.query.trim();
+    const terms = trimmed.split(/\s+/).filter(Boolean).slice(0, 6);
+    if (terms.length === 0) {
+      return this.listDocumentChunks({ documentId: params.documentId, limit });
+    }
+
+    const pattern = `%${escapeLike(trimmed)}%`;
+    const rows = this.db
+      .prepare(
+        `SELECT c.*, d.title, d.source, d.project_id
+         FROM chunks c
+         JOIN documents d ON d.id = c.document_id
+         WHERE c.document_id = ?
+           AND (d.title LIKE ? ESCAPE '\\' OR d.source LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\')
+         ORDER BY c.chunk_index ASC
+         LIMIT ?`
+      )
+      .all(params.documentId, pattern, pattern, pattern, limit) as unknown as ChunkJoinRow[];
+
+    return rows.map((row) => mapChunkEvidence(row, keywordScore(row, terms)));
+  }
+
+  listDocumentChunks(params: { documentId: string; limit?: number }): EvidenceItem[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.*, d.title, d.source, d.project_id
+         FROM chunks c
+         JOIN documents d ON d.id = c.document_id
+         WHERE c.document_id = ?
+         ORDER BY c.chunk_index ASC
+         LIMIT ?`
+      )
+      .all(params.documentId, params.limit ?? 8) as unknown as ChunkJoinRow[];
+
+    return rows.map((row, index) => mapChunkEvidence(row, index));
   }
 
   listRecentChunkEvidence(projectId: string, limit = 6): EvidenceItem[] {
@@ -347,6 +421,14 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS idx_messages_session ON conversation_messages(session_id, created_at);
 
+      CREATE TABLE IF NOT EXISTS session_state (
+        session_id TEXT PRIMARY KEY,
+        current_document_id TEXT,
+        current_document_title TEXT,
+        current_document_source TEXT,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS route_logs (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -406,6 +488,14 @@ interface DocumentRow {
   created_at: string;
 }
 
+interface SessionStateRow {
+  session_id: string;
+  current_document_id: string | null;
+  current_document_title: string | null;
+  current_document_source: string | null;
+  updated_at: string;
+}
+
 interface ChunkJoinRow {
   id: string;
   document_id: string;
@@ -415,6 +505,16 @@ interface ChunkJoinRow {
   title: string;
   source: string | null;
   project_id: string;
+}
+
+function mapSessionState(row: SessionStateRow): SessionState {
+  return {
+    sessionId: row.session_id,
+    currentDocumentId: row.current_document_id ?? undefined,
+    currentDocumentTitle: row.current_document_title ?? undefined,
+    currentDocumentSource: row.current_document_source ?? undefined,
+    updatedAt: row.updated_at
+  };
 }
 
 function mapDocument(row: DocumentRow): StoredDocument {
@@ -437,7 +537,8 @@ function mapChunkEvidence(row: ChunkJoinRow, score: number): EvidenceItem {
     title: row.title,
     source: row.source ?? undefined,
     content: row.content,
-    score
+    score,
+    chunkIndex: row.chunk_index
   };
 }
 

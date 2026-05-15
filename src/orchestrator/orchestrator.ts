@@ -6,21 +6,31 @@ import type {
   ChatStreamCallbacks,
   DocumentWriteProgressEvent,
   ExecutionResult,
+  EvidenceItem,
   EvidencePack,
   RequestContext,
   RoutePlan,
+  SkillExecutionResult,
+  SkillObservation,
+  SkillPlan,
   StoredDocumentInput
 } from "../types.js";
 import { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
 import { buildFinalPrompt, defaultConstraints } from "./contextBuilder.js";
-import { extractQueryPayload, extractWritePayload, Router } from "./router.js";
+import { extractWritePayload, Router } from "./router.js";
 import { DocumentService } from "../services/documentService.js";
 import { extractWeChatArticleUrl, WeChatArticleWorkflow } from "../services/weChatArticleWorkflow.js";
 import { RunTracker } from "./runTracker.js";
+import { SkillPlanner } from "./skillPlanner.js";
+import { SkillExecutor } from "./skillExecutor.js";
+import { observeSkillResults } from "./skillObserver.js";
+import { capabilities } from "./registry.js";
 
 export class Orchestrator {
   private readonly router: Router;
   private readonly wechatArticles: WeChatArticleWorkflow;
+  private readonly skillPlanner = new SkillPlanner();
+  private readonly skillExecutor: SkillExecutor;
 
   constructor(
     private readonly config: AppConfig,
@@ -30,39 +40,28 @@ export class Orchestrator {
   ) {
     this.router = new Router(ai, config.ai.routerModel);
     this.wechatArticles = new WeChatArticleWorkflow(config.wespy);
+    this.skillExecutor = new SkillExecutor(documents);
   }
 
   async chat(input: { message: string; sessionId?: string; userId?: string; projectId?: string }): Promise<ChatResponse> {
     const context = createRequestContext(input, this.config.defaultProjectId);
-    this.sqlite.insertMessage({
-      id: randomUUID(),
-      sessionId: context.sessionId,
-      role: "user",
-      content: context.message,
-      createdAt: context.createdAt
-    });
+    this.insertUserMessage(context);
 
+    const sessionState = this.sqlite.getSessionState(context.sessionId);
     const routePlan = await this.router.route(context);
     this.sqlite.insertRouteLog(context, routePlan);
+    const skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities);
+    routePlan.skillPlan = skillPlan;
+    routePlan.answerStrategy = skillPlan.answerStrategy;
+    routePlan.requiresEvidence = skillPlan.requiresEvidence;
 
     const executionResult = await this.executeIfNeeded(context, routePlan);
-    const evidencePack = await this.retrieveIfNeeded(context, routePlan, executionResult);
-    const answer = await this.generateAnswer(context, routePlan, executionResult, evidencePack);
+    const { skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan);
+    const guardAnswer = guardedNoEvidenceAnswer(skillPlan, observation);
+    const answer = guardAnswer ?? (await this.generateAnswer(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation));
 
-    this.sqlite.insertMessage({
-      id: randomUUID(),
-      sessionId: context.sessionId,
-      role: "assistant",
-      content: answer,
-      createdAt: new Date().toISOString()
-    });
-
-    return {
-      answer,
-      routePlan,
-      evidencePack,
-      executionResult
-    };
+    this.insertAssistantMessage(context.sessionId, answer);
+    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation };
   }
 
   async chatStream(
@@ -70,13 +69,7 @@ export class Orchestrator {
     callbacks: ChatStreamCallbacks
   ): Promise<ChatResponse> {
     const context = createRequestContext(input, this.config.defaultProjectId);
-    this.sqlite.insertMessage({
-      id: randomUUID(),
-      sessionId: context.sessionId,
-      role: "user",
-      content: context.message,
-      createdAt: context.createdAt
-    });
+    this.insertUserMessage(context);
 
     const runId = randomUUID();
     this.sqlite.createRun({
@@ -91,6 +84,9 @@ export class Orchestrator {
     const tracker = new RunTracker(this.sqlite, callbacks, runId);
 
     let routePlan: RoutePlan | undefined;
+    let skillPlan: SkillPlan | undefined;
+    let skillResults: SkillExecutionResult[] = [];
+    let observation: SkillObservation | undefined;
     let executionResult: ExecutionResult | undefined;
     let evidencePack: EvidencePack | undefined;
     let finalAnswer = "";
@@ -103,45 +99,47 @@ export class Orchestrator {
         projectId: context.projectId
       });
 
+      const sessionState = this.sqlite.getSessionState(context.sessionId);
       await tracker.stepStarted("router", "正在判断这是普通对话、资料查询还是工作流任务。");
       routePlan = await this.router.route(context);
       this.sqlite.insertRouteLog(context, routePlan);
-      await tracker.stepCompleted("router", renderRouteMessage(routePlan), { routePlan });
+      skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities);
+      routePlan.skillPlan = skillPlan;
+      routePlan.answerStrategy = skillPlan.answerStrategy;
+      routePlan.requiresEvidence = skillPlan.requiresEvidence;
+      await tracker.stepCompleted("router", renderRouteMessage(routePlan), { routePlan, sessionState });
+      await tracker.skillPlan(skillPlan, renderSkillPlanMessage(skillPlan));
 
       executionResult = await this.executeIfNeeded(context, routePlan, tracker);
-      evidencePack = await this.retrieveIfNeeded(context, routePlan, executionResult, tracker);
+      ({ skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan, tracker));
 
-      await tracker.stepStarted("context", "正在整理证据和上下文。");
-      const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack);
-      await tracker.stepCompleted("context", "上下文已整理完成。", {
-        hasEvidence: Boolean(evidencePack),
-        evidenceCount: evidencePack?.items.length ?? 0,
-        hasExecutionResult: Boolean(executionResult)
-      });
+      const guardAnswer = guardedNoEvidenceAnswer(skillPlan, observation);
+      if (guardAnswer) {
+        finalAnswer = guardAnswer;
+        await tracker.observation(observation, "没有找到足够证据，停止生成。");
+        await tracker.answerDelta(finalAnswer);
+      } else {
+        await tracker.observation(observation, "证据足够，开始生成回答。");
+        await tracker.stepStarted("context", "正在整理证据和上下文。");
+        const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation);
+        await tracker.stepCompleted("context", "上下文已整理完成。", {
+          hasEvidence: Boolean(evidencePack),
+          evidenceCount: evidencePack?.items.length ?? 0,
+          hasExecutionResult: Boolean(executionResult),
+          skillResultCount: skillResults.length
+        });
 
-      await tracker.metadata({ routePlan, evidencePack, executionResult });
-
-      await tracker.stepStarted("generation", "正在生成最终回答。");
-      for await (const chunk of this.generateAnswerStreamFromPrepared(generationInput)) {
-        finalAnswer += chunk;
-        await tracker.answerDelta(chunk);
+        await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation });
+        await tracker.stepStarted("generation", "正在生成最终回答。");
+        for await (const chunk of this.generateAnswerStreamFromPrepared(generationInput)) {
+          finalAnswer += chunk;
+          await tracker.answerDelta(chunk);
+        }
+        await tracker.stepCompleted("generation", "回答生成完成。", { answerLength: finalAnswer.length });
       }
-      await tracker.stepCompleted("generation", "回答生成完成。", { answerLength: finalAnswer.length });
 
-      this.sqlite.insertMessage({
-        id: randomUUID(),
-        sessionId: context.sessionId,
-        role: "assistant",
-        content: finalAnswer,
-        createdAt: new Date().toISOString()
-      });
-
-      const result = {
-        answer: finalAnswer,
-        routePlan,
-        evidencePack,
-        executionResult
-      };
+      this.insertAssistantMessage(context.sessionId, finalAnswer);
+      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation };
       await tracker.done(result);
       return result;
     } catch (error) {
@@ -156,19 +154,40 @@ export class Orchestrator {
       status: "success",
       capabilityId: "workflow.ingest_text_database",
       message: "文档已写入 SQLite 与 LanceDB。",
-      output: {
-        documentId: result.document.id,
-        title: result.document.title,
-        chunkCount: result.chunkCount
-      }
+      output: { documentId: result.document.id, title: result.document.title, chunkCount: result.chunkCount }
     };
   }
 
-  private async executeIfNeeded(
+  private insertUserMessage(context: RequestContext): void {
+    this.sqlite.insertMessage({ id: randomUUID(), sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
+  }
+
+  private insertAssistantMessage(sessionId: string, answer: string): void {
+    this.sqlite.insertMessage({ id: randomUUID(), sessionId, role: "assistant", content: answer, createdAt: new Date().toISOString() });
+  }
+
+  private async executeSkillsIfNeeded(
     context: RequestContext,
-    routePlan: RoutePlan,
+    skillPlan: SkillPlan,
     tracker?: RunTracker
-  ): Promise<ExecutionResult | undefined> {
+  ): Promise<{ skillResults: SkillExecutionResult[]; observation: SkillObservation; evidencePack?: EvidencePack }> {
+    const skillResults: SkillExecutionResult[] = [];
+    for (const call of skillPlan.calls) {
+      await tracker?.skillStarted(call);
+      const result = await this.skillExecutor.execute(call, context);
+      skillResults.push(result);
+      if (result.status === "failed") {
+        await tracker?.skillFailed(result);
+      } else {
+        await tracker?.skillCompleted(result);
+      }
+    }
+    const observation = observeSkillResults(skillPlan, skillResults);
+    const evidencePack = mergeEvidencePacks(skillResults);
+    return { skillResults, observation, evidencePack };
+  }
+
+  private async executeIfNeeded(context: RequestContext, routePlan: RoutePlan, tracker?: RunTracker): Promise<ExecutionResult | undefined> {
     if (!routePlan.needsWorkflow && routePlan.taskType !== "workflow") {
       return undefined;
     }
@@ -186,22 +205,14 @@ export class Orchestrator {
     }
 
     if (!routePlan.candidateCapabilities.includes("workflow.ingest_text_database")) {
-      return {
-        status: "skipped",
-        message: "没有匹配到可执行的 Workflow。"
-      };
+      return { status: "skipped", message: "没有匹配到可执行的 Workflow。" };
     }
 
     await tracker?.stepStarted("execution", "正在整理并写入知识库。", { capabilityId: "workflow.ingest_text_database" });
     const parsed = extractWritePayload(context.message);
     const content = stringParam(routePlan.extractedParams.content) || parsed?.content;
     if (!content) {
-      const result: ExecutionResult = {
-        status: "failed",
-        capabilityId: "workflow.ingest_text_database",
-        message: "写入数据库缺少 content 参数。",
-        error: "missing content"
-      };
+      const result: ExecutionResult = { status: "failed", capabilityId: "workflow.ingest_text_database", message: "写入数据库缺少 content 参数。", error: "missing content" };
       await tracker?.stepFailed("execution", "写入知识库失败，缺少可写入内容。", result.error, { result });
       return result;
     }
@@ -212,11 +223,9 @@ export class Orchestrator {
         source: stringParam(routePlan.extractedParams.source) || parsed?.source,
         projectId: context.projectId,
         content,
-        metadata: {
-          requestId: context.requestId,
-          sessionId: context.sessionId
-        }
+        metadata: { requestId: context.requestId, sessionId: context.sessionId }
       },
+      context.sessionId,
       tracker
     );
     await tracker?.stepCompleted("execution", "资料已写入知识库。", { result });
@@ -226,10 +235,7 @@ export class Orchestrator {
   private async ingestWeChatArticle(context: RequestContext, url: string, tracker?: RunTracker): Promise<ExecutionResult> {
     try {
       const article = await this.wechatArticles.fetchArticle(url);
-      await tracker?.metadata(
-        { progress: { type: "wechat_article_fetched", url, title: article.title } },
-        "文章内容已获取，正在写入知识库。"
-      );
+      await tracker?.metadata({ progress: { type: "wechat_article_fetched", url, title: article.title } }, "文章内容已获取，正在写入知识库。");
       const result = await this.writeDocumentWithProgress(
         {
           title: article.title,
@@ -247,6 +253,7 @@ export class Orchestrator {
             wespyInfo: article.rawInfo
           }
         },
+        context.sessionId,
         tracker,
         "workflow.ingest_wechat_article"
       );
@@ -255,122 +262,84 @@ export class Orchestrator {
         ...result,
         capabilityId: "workflow.ingest_wechat_article",
         message: "公众号文章已通过 WeSpy 获取，并写入 SQLite 与 LanceDB。",
-        output: {
-          ...result.output,
-          source: article.url,
-          author: article.author,
-          publishTime: article.publishTime
-        }
+        output: { ...result.output, source: article.url, author: article.author, publishTime: article.publishTime }
       };
     } catch (error) {
-      return {
-        status: "failed",
-        capabilityId: "workflow.ingest_wechat_article",
-        message: "公众号文章写入数据库失败。",
-        error: error instanceof Error ? error.message : String(error)
-      };
+      return { status: "failed", capabilityId: "workflow.ingest_wechat_article", message: "公众号文章写入数据库失败。", error: error instanceof Error ? error.message : String(error) };
     }
   }
 
   private async writeDocumentWithProgress(
     input: StoredDocumentInput,
+    sessionId: string,
     tracker?: RunTracker,
     capabilityId = "workflow.ingest_text_database"
   ): Promise<ExecutionResult> {
     const result = await this.documents.writeDocument(input, async (event) => {
       await tracker?.metadata({ progress: event }, documentProgressMessage(event));
     });
+    this.sqlite.upsertSessionState({
+      sessionId,
+      currentDocumentId: result.document.id,
+      currentDocumentTitle: result.document.title,
+      currentDocumentSource: result.document.source
+    });
     return {
       status: "success",
       capabilityId,
       message: "文档已写入 SQLite 与 LanceDB。",
-      output: {
-        documentId: result.document.id,
-        title: result.document.title,
-        chunkCount: result.chunkCount
-      }
+      output: { documentId: result.document.id, title: result.document.title, chunkCount: result.chunkCount }
     };
-  }
-
-  private async retrieveIfNeeded(
-    context: RequestContext,
-    routePlan: RoutePlan,
-    executionResult?: ExecutionResult,
-    tracker?: RunTracker
-  ) {
-    if (!routePlan.needsRag || executionResult?.capabilityId?.startsWith("workflow.ingest_")) {
-      return undefined;
-    }
-
-    const query =
-      stringParam(routePlan.extractedParams.query) ||
-      routePlan.searchQueries[0] ||
-      extractQueryPayload(context.message) ||
-      context.message;
-
-    await tracker?.stepStarted("retrieval", "正在检索资料库。", { query, skillId: selectRetrievalSkill(routePlan) });
-    const evidencePack = await this.documents.search({
-      query,
-      projectId: context.projectId,
-      limit: 6,
-      skillId: selectRetrievalSkill(routePlan)
-    });
-    const count = evidencePack.items.length;
-    await tracker?.stepCompleted("retrieval", count > 0 ? `已找到 ${count} 条相关资料。` : "没有找到足够相关资料。", {
-      query,
-      count,
-      skillId: evidencePack.skillId
-    });
-    return evidencePack;
   }
 
   private async generateAnswer(
     context: RequestContext,
     routePlan: RoutePlan,
     executionResult?: ExecutionResult,
-    evidencePack?: EvidencePack
+    evidencePack?: EvidencePack,
+    skillPlan?: SkillPlan,
+    skillResults?: SkillExecutionResult[],
+    observation?: SkillObservation
   ): Promise<string> {
-    const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack);
+    const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation);
     if (generationInput.kind === "static") {
       return generationInput.answer;
     }
-
-    return this.ai.chat({
-      model: this.config.ai.chatModel,
-      temperature: 0.3,
-      messages: buildFinalMessages(generationInput.history, generationInput.prompt)
-    });
+    return this.ai.chat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.history, generationInput.prompt) });
   }
 
   private prepareGenerationInput(
     context: RequestContext,
     routePlan: RoutePlan,
     executionResult?: ExecutionResult,
-    evidencePack?: EvidencePack
+    evidencePack?: EvidencePack,
+    skillPlan?: SkillPlan,
+    skillResults?: SkillExecutionResult[],
+    observation?: SkillObservation
   ): GenerationInput {
-    if (
-      executionResult?.capabilityId === "workflow.ingest_text_database" ||
-      executionResult?.capabilityId === "workflow.ingest_wechat_article"
-    ) {
+    if (executionResult?.capabilityId === "workflow.ingest_text_database" || executionResult?.capabilityId === "workflow.ingest_wechat_article") {
       return { kind: "static", answer: this.renderWorkflowAnswer(executionResult) };
     }
 
     if (!this.ai.canChat(this.config.ai.chatModel)) {
       return {
         kind: "static",
-        answer: evidencePack
-          ? renderEvidenceFallback(evidencePack.items)
-          : "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。"
+        answer: evidencePack ? renderEvidenceFallback(evidencePack.items) : "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。"
       };
     }
 
     const history = this.sqlite.listSessionMessages(context.sessionId, 8);
+    const answerStrategy = skillPlan?.answerStrategy ?? routePlan.answerStrategy ?? "direct";
     const prompt = buildFinalPrompt({
       request: context,
       routePlan,
       evidencePack,
       executionResult,
-      constraints: defaultConstraints()
+      skillPlan,
+      skillResults,
+      observation,
+      answerStrategy,
+      constraints: defaultConstraints(answerStrategy)
     });
     return { kind: "model", history, prompt };
   }
@@ -380,12 +349,7 @@ export class Orchestrator {
       yield generationInput.answer;
       return;
     }
-
-    for await (const chunk of this.ai.streamChat({
-      model: this.config.ai.chatModel,
-      temperature: 0.3,
-      messages: buildFinalMessages(generationInput.history, generationInput.prompt)
-    })) {
+    for await (const chunk of this.ai.streamChat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.history, generationInput.prompt) })) {
       yield chunk;
     }
   }
@@ -393,9 +357,7 @@ export class Orchestrator {
   private renderWorkflowAnswer(executionResult: ExecutionResult): string {
     if (executionResult.status === "success") {
       const title = executionResult.output?.title ? `，标题：${String(executionResult.output.title)}` : "";
-      return `已写入数据库${title}。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(
-        executionResult.output?.chunkCount
-      )}。`;
+      return `已写入数据库${title}。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(executionResult.output?.chunkCount)}。`;
     }
     return `写入数据库失败：${executionResult.error ?? executionResult.message}`;
   }
@@ -407,34 +369,14 @@ type GenerationInput =
 
 function buildFinalMessages(history: Array<{ role: "user" | "assistant"; content: string }>, prompt: string) {
   return [
-    {
-      role: "system" as const,
-      content: "你是 AI Orchestrator 的最终生成模型。你不重新决定系统路径，只基于给定任务包回答。"
-    },
+    { role: "system" as const, content: "你是 AI Orchestrator 的最终生成模型。你不重新决定系统路径，只基于给定任务包回答。" },
     ...history,
     { role: "user" as const, content: prompt }
   ];
 }
 
-function createRequestContext(
-  input: { message: string; sessionId?: string; userId?: string; projectId?: string },
-  defaultProjectId: string
-): RequestContext {
-  return {
-    requestId: randomUUID(),
-    sessionId: input.sessionId || randomUUID(),
-    userId: input.userId,
-    projectId: input.projectId || defaultProjectId,
-    message: input.message,
-    createdAt: new Date().toISOString()
-  };
-}
-
-function selectRetrievalSkill(routePlan: RoutePlan): string {
-  if (routePlan.candidateCapabilities.includes("skill.sqlite_query")) {
-    return "skill.sqlite_query";
-  }
-  return "skill.lancedb_query";
+function createRequestContext(input: { message: string; sessionId?: string; userId?: string; projectId?: string }, defaultProjectId: string): RequestContext {
+  return { requestId: randomUUID(), sessionId: input.sessionId || randomUUID(), userId: input.userId, projectId: input.projectId || defaultProjectId, message: input.message, createdAt: new Date().toISOString() };
 }
 
 function stringParam(value: unknown): string | undefined {
@@ -443,38 +385,57 @@ function stringParam(value: unknown): string | undefined {
 
 function renderRouteMessage(routePlan: RoutePlan): string {
   if (routePlan.needsWorkflow || routePlan.taskType === "workflow") {
-    if (routePlan.candidateCapabilities.includes("workflow.ingest_wechat_article")) {
-      return "判断完成：需要抓取公众号文章并写入知识库。";
-    }
+    if (routePlan.candidateCapabilities.includes("workflow.ingest_wechat_article")) return "判断完成：需要抓取公众号文章并写入知识库。";
     return "判断完成：需要执行资料写入流程。";
   }
-  if (routePlan.needsRag) {
-    return "判断完成：需要检索资料库后回答。";
-  }
+  if (routePlan.needsRag || routePlan.needsSkill) return "判断完成：需要调用资料 Skill 获取证据后回答。";
   return "判断完成：这是普通对话，将直接生成回答。";
+}
+
+function renderSkillPlanMessage(skillPlan: SkillPlan): string {
+  if (skillPlan.calls.length === 0) return skillPlan.answerStrategy === "workflow" ? "该请求将由工作流处理。" : "无需调用资料 Skill，可以直接回答。";
+  return "我需要先从已保存资料里查找相关内容。";
+}
+
+function guardedNoEvidenceAnswer(skillPlan: SkillPlan, observation: SkillObservation): string | undefined {
+  if (skillPlan.requiresEvidence && !observation.enoughToAnswer) {
+    return skillPlan.answerStrategy === "citation" ? "我没有找到可引用的原文段落，不能提供原文引用。" : "我没有从已保存资料中找到足够证据，不能可靠回答。你可以指定文档、重新入库，或换一个更明确的问题。";
+  }
+  return undefined;
+}
+
+function mergeEvidencePacks(skillResults: SkillExecutionResult[]): EvidencePack | undefined {
+  const seen = new Set<string>();
+  const items: EvidenceItem[] = [];
+  const skillIds: string[] = [];
+  const queries: string[] = [];
+  for (const result of skillResults) {
+    if (!result.evidencePack) continue;
+    skillIds.push(result.skillId);
+    queries.push(result.evidencePack.query);
+    for (const item of result.evidencePack.items) {
+      const key = item.chunkId || `${item.documentId}:${item.chunkIndex ?? item.content.slice(0, 32)}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        items.push(item);
+      }
+    }
+  }
+  if (skillResults.length === 0) return undefined;
+  return { query: [...new Set(queries)].join(" | "), skillId: [...new Set(skillIds)].join(","), items };
 }
 
 function documentProgressMessage(event: DocumentWriteProgressEvent): string {
   switch (event.type) {
-    case "document_created":
-      return "文档记录已创建。";
-    case "chunks_created":
-      return `已完成切片，共 ${event.chunkCount} 段。`;
-    case "embedding_started":
-      return "正在生成向量表示。";
-    case "embedding_progress":
-      return `向量生成进度：${event.completed}/${event.total}。`;
-    case "vectors_written":
-      return `向量已写入，共 ${event.vectorCount} 条。`;
+    case "document_created": return "文档记录已创建。";
+    case "chunks_created": return `已完成切片，共 ${event.chunkCount} 段。`;
+    case "embedding_started": return "正在生成向量表示。";
+    case "embedding_progress": return `向量生成进度：${event.completed}/${event.total}。`;
+    case "vectors_written": return `向量已写入，共 ${event.vectorCount} 条。`;
   }
 }
 
 function renderEvidenceFallback(items: Array<{ title: string; content: string; source?: string }>): string {
-  if (items.length === 0) {
-    return "没有从数据库中检索到相关资料。";
-  }
-
-  return items
-    .map((item, index) => `证据 ${index + 1}｜${item.title}${item.source ? `｜${item.source}` : ""}\n${item.content}`)
-    .join("\n\n");
+  if (items.length === 0) return "没有从数据库中检索到相关资料。";
+  return items.map((item, index) => `证据 ${index + 1}｜${item.title}${item.source ? `｜${item.source}` : ""}\n${item.content}`).join("\n\n");
 }
