@@ -51,6 +51,12 @@ form.addEventListener("submit", async (event) => {
         updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage || event.error, "failed");
       }
 
+      if (["skill_plan", "skill_started", "skill_completed", "skill_failed", "observation"].includes(event.type)) {
+        const state = event.type === "skill_failed" ? "failed" : event.type === "skill_started" ? "running" : "done";
+        addProgressItem(assistantMessage.progress, progressEventKey(event), event.visibleMessage || event.type, state);
+        renderDetails(event);
+      }
+
       if (event.type === "metadata") {
         if (event.visibleMessage) {
           addProgressItem(assistantMessage.progress, metadataProgressKey(event), event.visibleMessage, "done");
@@ -216,6 +222,16 @@ function addProgressItem(container, key, message, state) {
 function metadataProgressKey(event) {
   const progressType = event.payload?.progress?.type;
   return progressType ? `metadata-${progressType}` : `metadata-${crypto.randomUUID()}`;
+}
+
+function progressEventKey(event) {
+  if (event.type === "skill_started") {
+    return `skill-${event.call?.id || crypto.randomUUID()}`;
+  }
+  if (event.type === "skill_completed" || event.type === "skill_failed") {
+    return `skill-${event.result?.callId || crypto.randomUUID()}`;
+  }
+  return `${event.type}-${crypto.randomUUID()}`;
 }
 
 function cssEscape(value) {
@@ -463,6 +479,9 @@ function renderDetails(payload) {
     {
       runId: payload.runId,
       routePlan: payload.routePlan ?? payload.payload?.routePlan,
+      skillPlan: payload.skillPlan ?? payload.payload?.skillPlan,
+      skillResults: payload.skillResults ?? payload.payload?.skillResults,
+      observation: payload.observation ?? payload.payload?.observation,
       executionResult: payload.executionResult ?? payload.payload?.executionResult,
       evidencePack: payload.evidencePack ?? payload.payload?.evidencePack
     },

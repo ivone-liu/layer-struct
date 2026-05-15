@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { SqliteStore } from "../storage/sqliteStore.js";
-import type { ChatStreamCallbacks, ChatStreamEvent, EvidencePack, ExecutionResult, RoutePlan, RunStepName } from "../types.js";
+import type { ChatStreamCallbacks, ChatStreamEvent, EvidencePack, ExecutionResult, RoutePlan, RunStepName, SkillCall, SkillExecutionResult, SkillObservation, SkillPlan } from "../types.js";
 
 export class RunTracker {
   private readonly activeStepIds = new Map<RunStepName, string>();
@@ -79,7 +79,36 @@ export class RunTracker {
       payload,
       routePlan: "routePlan" in payload ? (payload.routePlan as RoutePlan) : undefined,
       evidencePack: "evidencePack" in payload ? (payload.evidencePack as EvidencePack | undefined) : undefined,
-      executionResult: "executionResult" in payload ? (payload.executionResult as ExecutionResult | undefined) : undefined
+      executionResult: "executionResult" in payload ? (payload.executionResult as ExecutionResult | undefined) : undefined,
+      skillPlan: "skillPlan" in payload ? (payload.skillPlan as SkillPlan | undefined) : undefined,
+      skillResults: "skillResults" in payload ? (payload.skillResults as SkillExecutionResult[] | undefined) : undefined,
+      observation: "observation" in payload ? (payload.observation as SkillObservation | undefined) : undefined
+    });
+  }
+
+  async skillPlan(skillPlan: SkillPlan, visibleMessage = "我需要先从已保存资料里查找相关内容。"): Promise<void> {
+    await this.emit({ type: "skill_plan", runId: this.runId, visibleMessage, skillPlan });
+  }
+
+  async skillStarted(call: SkillCall, visibleMessage?: string): Promise<void> {
+    await this.emit({ type: "skill_started", runId: this.runId, visibleMessage: visibleMessage ?? renderSkillStart(call.skillId), call });
+  }
+
+  async skillCompleted(result: SkillExecutionResult, visibleMessage?: string): Promise<void> {
+    const message = visibleMessage ?? `已找到 ${result.evidencePack?.items.length ?? 0} 条相关内容。`;
+    await this.emit({ type: "skill_completed", runId: this.runId, visibleMessage: message, result });
+  }
+
+  async skillFailed(result: SkillExecutionResult, visibleMessage = "资料查询失败。"): Promise<void> {
+    await this.emit({ type: "skill_failed", runId: this.runId, visibleMessage, result });
+  }
+
+  async observation(observation: SkillObservation, visibleMessage?: string): Promise<void> {
+    await this.emit({
+      type: "observation",
+      runId: this.runId,
+      visibleMessage: visibleMessage ?? (observation.enoughToAnswer ? "证据足够，开始生成回答。" : "没有找到足够证据，停止生成。"),
+      observation
     });
   }
 
@@ -137,4 +166,8 @@ export class RunTracker {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function renderSkillStart(skillId: string): string {
+  return skillId === "skill.sqlite_query" ? "正在调用资料库精确查询。" : "正在调用资料库语义检索。";
 }
