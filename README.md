@@ -10,6 +10,7 @@
 - 使用 LanceDB 保存文本切片向量
 - 使用云端 Embedding 服务完成写入和查询所需向量化
 - 使用云端 Chat 服务生成最终回答
+- 支持 Orchestrator 进入后先即时响应“执行中...”，再通过流式响应输出最终答案
 - 通过 WeSpy 获取微信公众号文章并写入 SQLite 与 LanceDB
 - 提供一个简单对话页面
 
@@ -68,6 +69,17 @@ Orchestrator 是代码主导、模型辅助的请求调度系统。
 ```text
 查询数据库：Orchestrator 的职责是什么？
 ```
+
+## 流式对话接口
+
+页面默认调用 `POST /api/chat/stream`，服务端通过 SSE 返回事件：
+
+- `assistant_delta`：可直接追加到当前助手消息气泡的文本增量。
+- `status`：当前执行状态，例如 `执行中...`。
+- `metadata`：路由、执行结果和证据包，便于页面实时刷新详情面板。
+- `done`：完整回答和最终元数据。
+
+保留 `POST /api/chat` 用于一次性 JSON 响应。
 
 ## WeSpy 公众号文章工作流
 

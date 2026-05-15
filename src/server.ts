@@ -8,7 +8,7 @@ import { Orchestrator } from "./orchestrator/orchestrator.js";
 import { DocumentService } from "./services/documentService.js";
 import { LanceVectorStore } from "./storage/lanceVectorStore.js";
 import { SqliteStore } from "./storage/sqliteStore.js";
-import type { StoredDocumentInput } from "./types.js";
+import type { ChatStreamEvent, StoredDocumentInput } from "./types.js";
 
 const config = loadConfig();
 await mkdir(config.dataDir, { recursive: true });
@@ -58,6 +58,42 @@ const server = createServer(async (request, response) => {
         userId: body.userId
       });
       return json(response, 200, result);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/chat/stream") {
+      const body = await readJsonBody<{ message?: string; sessionId?: string; projectId?: string; userId?: string }>(request);
+      if (!body.message?.trim()) {
+        return json(response, 400, { error: "message is required" });
+      }
+
+      response.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no"
+      });
+
+      try {
+        await orchestrator.chatStream(
+          {
+            message: body.message,
+            sessionId: body.sessionId,
+            projectId: body.projectId,
+            userId: body.userId
+          },
+          {
+            onEvent: (event) => writeSse(response, event)
+          }
+        );
+      } catch (error) {
+        writeSse(response, {
+          type: "error",
+          error: error instanceof Error ? error.message : "unknown error"
+        });
+      } finally {
+        response.end();
+      }
+      return;
     }
 
     if (request.method === "POST" && url.pathname === "/api/documents") {
@@ -122,6 +158,11 @@ async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
     return {} as T;
   }
   return JSON.parse(raw) as T;
+}
+
+function writeSse(response: ServerResponse, event: ChatStreamEvent): void {
+  response.write(`event: ${event.type}\n`);
+  response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
 function json(response: ServerResponse, statusCode: number, body: unknown): void {
