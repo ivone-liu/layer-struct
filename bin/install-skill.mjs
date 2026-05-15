@@ -343,7 +343,7 @@ function readAiConfig() {
   const apiKey = process.env.AI_API_KEY ?? process.env.OPENAI_API_KEY;
   const model = process.env.AI_SKILL_REGISTRY_MODEL ?? process.env.AI_ROUTER_MODEL ?? process.env.AI_CHAT_MODEL ?? process.env.OPENAI_MODEL;
   const rawBaseUrl = process.env.AI_BASE_URL ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
-  const timeoutMs = numberFromEnv(process.env.AI_SKILL_REGISTRY_TIMEOUT_MS) ?? numberFromEnv(process.env.AI_REQUEST_TIMEOUT_MS) ?? 60000;
+  const timeoutMs = numberFromEnv(process.env.AI_SKILL_REGISTRY_TIMEOUT_MS) ?? numberFromEnv(process.env.AI_REQUEST_TIMEOUT_MS) ?? 180000;
   if (!apiKey) {
     throw new Error("AI_API_KEY or OPENAI_API_KEY is required to generate skill registry metadata with the model.");
   }
