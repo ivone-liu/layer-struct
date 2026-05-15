@@ -3,10 +3,13 @@ import type { AnswerStrategy, ExpandedEvidenceItem, EvidenceItem, FinalContext, 
 export function buildFinalPrompt(context: FinalContext): string {
   const answerStrategy = context.answerStrategy ?? context.skillPlan?.answerStrategy ?? context.routePlan.answerStrategy ?? "direct";
   const evidence = renderEvidence(context.evidencePack, answerStrategy);
+  const conversationContext = renderConversationContext(context.conversationContext);
   const memoryHits = context.memoryHits ?? context.evidencePack?.memoryHits ?? [];
 
   return `用户请求：
 ${context.request.message}
+
+${conversationContext}
 
 RoutePlan（compact）：
 ${JSON.stringify(compactRoutePlan(context.routePlan), null, 2)}
@@ -34,6 +37,19 @@ ${context.executionResult ? JSON.stringify({ status: context.executionResult.sta
 
 约束：
 ${context.constraints.map((item) => `- ${item}`).join("\n")}`;
+}
+
+function renderConversationContext(pack: FinalContext["conversationContext"]): string {
+  if (!pack) {
+    return "对话压缩上下文：无。\n\n最近两轮原文：无。";
+  }
+  const compressed = pack.compressedText
+    ? `对话压缩上下文（历史对话的保真压缩上下文，用于延续目标和约束；不可把压缩内容当作原文资料证据）：\n${pack.compressedText}`
+    : "对话压缩上下文：无。";
+  const recent = pack.recentMessages.length
+    ? pack.recentMessages.map((message) => `[${message.role}] ${message.content}`).join("\n\n")
+    : "无。";
+  return `${compressed}\n\n最近两轮原文（优先级高于压缩摘要，保持 role 和 content）：\n${recent}`;
 }
 
 export function summarizeSkillResults(skillResults: SkillExecutionResult[]): Array<{

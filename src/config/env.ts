@@ -22,6 +22,11 @@ export interface AppConfig {
     defaultScore: number;
   };
   evidenceContextWindow: number;
+  context: {
+    rawRecentTurns: number;
+    compressMinMessages: number;
+    compressMaxMessages: number;
+  };
   defaultProjectId: string;
   wespy: {
     command: string;
@@ -33,6 +38,7 @@ export interface AppConfig {
     apiKey: string;
     routerModel: string;
     chatModel: string;
+    compressorModel: string;
     embeddingModel: string;
     embeddingDim: number;
     requestTimeoutMs: number;
@@ -102,6 +108,11 @@ export function loadConfig(): AppConfig {
       defaultScore: readNumber("MEMORY_DEFAULT_SCORE", 5)
     },
     evidenceContextWindow: readNumber("EVIDENCE_CONTEXT_WINDOW", 1),
+    context: {
+      rawRecentTurns: readNumber("CONTEXT_RAW_RECENT_TURNS", 2),
+      compressMinMessages: readNumber("CONTEXT_COMPRESS_MIN_MESSAGES", 6),
+      compressMaxMessages: readNumber("CONTEXT_COMPRESS_MAX_MESSAGES", 30)
+    },
     defaultProjectId: readString("DEFAULT_PROJECT_ID", "default"),
     wespy: {
       command: readString("WESPY_COMMAND", "wespy"),
@@ -113,6 +124,7 @@ export function loadConfig(): AppConfig {
       apiKey: readString("AI_API_KEY"),
       routerModel: readString("AI_ROUTER_MODEL"),
       chatModel: readString("AI_CHAT_MODEL"),
+      compressorModel: readString("AI_COMPRESSOR_MODEL", readString("AI_ROUTER_MODEL", readString("AI_CHAT_MODEL"))),
       embeddingModel: readString("AI_EMBEDDING_MODEL"),
       embeddingDim: readNumber("AI_EMBEDDING_DIM", 1536),
       requestTimeoutMs: readNumber("AI_REQUEST_TIMEOUT_MS", 60000),

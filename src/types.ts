@@ -7,6 +7,103 @@ export type RunStepName = "intake" | "router" | "execution" | "retrieval" | "con
 export type RunStepStatus = "running" | "completed" | "failed";
 export type AnswerStrategy = "direct" | "rag" | "citation" | "workflow" | "multi_step";
 
+
+export type ConversationStatus = "active" | "archived";
+
+export interface ConversationSession {
+  id: string;
+  userId?: string;
+  projectId: string;
+  title: string;
+  status: ConversationStatus;
+  messageCount: number;
+  lastMessagePreview?: string;
+  lastMessageAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  archivedAt?: string;
+}
+
+export interface ConversationMessage {
+  id: string;
+  sessionId: string;
+  runId?: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  contentType: "text" | "markdown" | "json" | "error" | "workflow_result";
+  metadata: Record<string, unknown>;
+  tokenEstimate: number;
+  createdAt: string;
+}
+
+export interface ConversationCompressedContext {
+  userGoals: string[];
+  facts: string[];
+  decisions: string[];
+  openQuestions: string[];
+  referencedDocuments: Array<{
+    documentId?: string;
+    title?: string;
+    source?: string;
+    reason: string;
+  }>;
+  userPreferences: string[];
+  corrections: string[];
+  workflowResults: string[];
+  importantMessages: Array<{
+    role: "user" | "assistant" | "system";
+    content: string;
+    reason: string;
+  }>;
+}
+
+export interface ConversationSummary {
+  id: string;
+  sessionId: string;
+  projectId: string;
+  userId?: string;
+  fromMessageId: string;
+  toMessageId: string;
+  messageCount: number;
+  summaryJson: ConversationCompressedContext;
+  summaryText: string;
+  model: string;
+  tokenEstimate: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConversationContextPack {
+  compressedContext?: ConversationCompressedContext;
+  compressedText?: string;
+  recentMessages: ConversationMessage[];
+  summaryId?: string;
+}
+
+export type CollectedItemKind =
+  | "manual_text"
+  | "wechat_article"
+  | "url"
+  | "note"
+  | "transcript"
+  | "unknown";
+
+export interface CollectedItem {
+  id: string;
+  projectId: string;
+  userId?: string;
+  sessionId?: string;
+  kind: CollectedItemKind;
+  title: string;
+  source?: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  documentId?: string;
+  contentHash?: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type MemoryKind =
   | "document_anchor"
   | "session_summary"
@@ -45,7 +142,7 @@ export interface SkillExecutionResult {
   skillId: string;
   status: "success" | "failed" | "empty" | "skipped";
   evidencePack?: EvidencePack;
-  output?: Record<string, unknown>;
+  output?: Record<string, unknown> & { collectedItemId?: string; documentId?: string; chunkCount?: number; memoryId?: string; };
   error?: string;
 }
 
@@ -194,7 +291,7 @@ export interface ExecutionResult {
   status: "success" | "failed" | "skipped";
   capabilityId?: string;
   message: string;
-  output?: Record<string, unknown>;
+  output?: Record<string, unknown> & { collectedItemId?: string; documentId?: string; chunkCount?: number; memoryId?: string; };
   error?: string;
 }
 
@@ -217,6 +314,7 @@ export interface FinalContext {
   answerStrategy?: AnswerStrategy;
   constraints: string[];
   memoryHits?: MemoryHit[];
+  conversationContext?: ConversationContextPack;
 }
 
 export interface ChatResponse {
@@ -228,6 +326,8 @@ export interface ChatResponse {
   skillResults?: SkillExecutionResult[];
   observation?: SkillObservation;
   memoryHits?: MemoryHit[];
+  conversation?: ConversationSession;
+  conversationContext?: ConversationContextPack;
 }
 
 export type DocumentWriteProgressEvent =
@@ -238,6 +338,12 @@ export type DocumentWriteProgressEvent =
   | { type: "vectors_written"; documentId: string; vectorCount: number };
 
 export type ChatStreamEvent =
+  | { type: "conversation_created"; runId?: string; visibleMessage: string; conversation: ConversationSession }
+  | { type: "conversation_updated"; runId?: string; visibleMessage: string; conversation: ConversationSession }
+  | { type: "context_compression_started"; runId?: string; visibleMessage: string; sessionId: string }
+  | { type: "context_compression_completed"; runId?: string; visibleMessage: string; conversationContext: ConversationContextPack }
+  | { type: "collected_item_created"; runId?: string; visibleMessage: string; collectedItem: CollectedItem }
+  | { type: "collected_item_completed"; runId?: string; visibleMessage: string; collectedItem: CollectedItem }
   | { type: "run_started"; runId: string; status: RunStatus; visibleMessage: string; createdAt: string }
   | {
       type: "step_started";
@@ -282,6 +388,8 @@ export type ChatStreamEvent =
       skillResults?: SkillExecutionResult[];
       observation?: SkillObservation;
       memoryHits?: MemoryHit[];
+      conversation?: ConversationSession;
+      conversationContext?: ConversationContextPack;
     }
   | {
       type: "done";
@@ -295,6 +403,8 @@ export type ChatStreamEvent =
       skillResults?: SkillExecutionResult[];
       observation?: SkillObservation;
       memoryHits?: MemoryHit[];
+      conversation?: ConversationSession;
+      conversationContext?: ConversationContextPack;
     }
   | { type: "memory_started"; runId: string; visibleMessage: string }
   | { type: "memory_completed"; runId: string; visibleMessage: string; memoryHits: MemoryHit[] }

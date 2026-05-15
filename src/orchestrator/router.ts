@@ -40,7 +40,7 @@ function routerSystemPrompt(): string {
   return `你是 AI Orchestrator Router，只输出 JSON，不回答用户。
 
 任务类型只能是 chat、rag_chat、skill_call、workflow。
-当用户要求保存、记录、入库、写入数据库时，选择 workflow。
+当用户要求保存、采集、收集、记录、入库、存为资料、保存到知识库、写入数据库时，优先选择 workflow.ingest_collected_content。
 当用户消息中包含 https://mp.weixin.qq.com/ 开头链接，并要求保存/入库/记录公众号文章内容时，选择 workflow.ingest_wechat_article，并提取 url。
 当用户要求查询数据库、知识库、根据资料回答、检索资料时，选择 rag_chat 或 skill_call。语义/相似/RAG/向量检索优先 skill.lancedb_query；SQLite/SQL/元数据/标题/来源/最近/精确关键词查询优先 skill.sqlite_query。
 如果用户实际依赖已保存资料，即使没有说“查询”，也必须标记 needsSkill=true、needsRag=true、requiresEvidence=true，不能默认 chat。包括：原文、引用、具体段落、出处、文中怎么说、哪一段、摘录；这篇文章、上面那篇、刚才保存、刚才写入、最近保存；根据资料、从库里、知识库、数据库、历史记录、已保存内容；帮我总结刚才那篇、提炼刚才那篇、详细展开刚才那篇。
@@ -101,9 +101,9 @@ function routeByRules(message: string): RoutePlan {
         needsMemory: false,
         needsSkill: false,
         needsWorkflow: true,
-        capabilityQuery: "写入数据库 文本入库 知识库保存",
+        capabilityQuery: "采集信息入库 文本入库 知识库保存",
         searchQueries: [],
-        candidateCapabilities: ["workflow.ingest_text_database"],
+        candidateCapabilities: ["workflow.ingest_collected_content"],
         extractedParams: writePayload,
         missingParams: writePayload.content ? [] : ["content"],
         confidence: 0.86,
@@ -186,7 +186,7 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
     candidateCapabilities.unshift("workflow.ingest_wechat_article");
   }
   if (taskType === "workflow" && candidateCapabilities.length === 0) {
-    candidateCapabilities.push(wechatUrl ? "workflow.ingest_wechat_article" : "workflow.ingest_text_database");
+    candidateCapabilities.push(wechatUrl ? "workflow.ingest_wechat_article" : "workflow.ingest_collected_content");
   }
   if ((taskType === "rag_chat" || taskType === "skill_call") && candidateCapabilities.length === 0) {
     candidateCapabilities.push(selectQuerySkill(message));
@@ -226,7 +226,7 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
 
 function normalizeCandidateCapabilities(value: unknown, message: string): string[] {
   const capabilities = Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-  return capabilities.map((capability) => (capability === "skill.query_database" ? selectQuerySkill(message) : capability));
+  return capabilities.map((capability) => capability === "skill.query_database" ? selectQuerySkill(message) : capability === "workflow.ingest_text_database" ? "workflow.ingest_collected_content" : capability);
 }
 
 function normalizeExtractedParams(params: unknown, wechatUrl?: string): Record<string, unknown> {
@@ -243,7 +243,7 @@ export function extractWritePayload(message: string): { title: string; content: 
   }
 
   const payload = message.replace(/^(请你|请|帮我)?\s*(把|将)?\s*(以下|下面|这段)?\s*/, "");
-  const contentStart = payload.replace(/^(写入数据库|保存到数据库|保存这段资料到知识库|保存这段|入库|记录到知识库|保存到知识库)[:：]?\s*/u, "");
+  const contentStart = payload.replace(/^(写入数据库|保存到数据库|保存这段资料到知识库|保存这段|采集这段|收集一下|入库|存为资料|记录这篇|记录到知识库|保存到知识库)[:：]?\s*/u, "");
   const titleMatch = contentStart.match(/标题[:：]\s*(.+)/);
   const sourceMatch = contentStart.match(/来源[:：]\s*(.+)/);
   const lines = contentStart
@@ -289,7 +289,7 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function hasWriteIntent(message: string): boolean {
-  return /(写入数据库|保存到数据库|保存这段|保存|入库|记录到知识库|保存到知识库|公众号文章)/u.test(message);
+  return /(写入数据库|保存到数据库|保存这段|采集这段|收集一下|保存|入库|存为资料|记录这篇|记录到知识库|保存到知识库|公众号文章)/u.test(message);
 }
 
 function extractImplicitEvidenceQuery(message: string): string | undefined {

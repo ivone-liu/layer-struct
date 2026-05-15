@@ -1,7 +1,14 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
+  CollectedItem,
+  CollectedItemKind,
+  ConversationCompressedContext,
+  ConversationMessage,
+  ConversationSession,
+  ConversationSummary,
   EvidenceItem,
   ExpandedEvidenceItem,
   MemoryHit,
@@ -392,33 +399,260 @@ export class SqliteStore {
     return expanded;
   }
 
-  insertMessage(params: {
-    id: string;
-    sessionId: string;
-    role: "user" | "assistant";
-    content: string;
-    createdAt: string;
-  }): void {
+
+  createConversationSession(params: {
+    id?: string;
+    userId?: string;
+    projectId: string;
+    title?: string;
+    status?: ConversationSession["status"];
+    createdAt?: string;
+  }): ConversationSession {
+    const now = params.createdAt ?? new Date().toISOString();
+    const session: ConversationSession = {
+      id: params.id ?? cryptoRandomId(),
+      userId: params.userId,
+      projectId: params.projectId,
+      title: normalizeTitle(params.title || "新对话"),
+      status: params.status ?? "active",
+      messageCount: 0,
+      createdAt: now,
+      updatedAt: now
+    };
     this.db
       .prepare(
-        `INSERT INTO conversation_messages (id, session_id, role, content, created_at)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO conversation_sessions (id, user_id, project_id, title, status, message_count, last_message_preview, last_message_at, created_at, updated_at, archived_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(params.id, params.sessionId, params.role, params.content, params.createdAt);
+      .run(session.id, session.userId ?? null, session.projectId, session.title, session.status, session.messageCount, null, null, session.createdAt, session.updatedAt, null);
+    return session;
   }
 
-  listSessionMessages(sessionId: string, limit = 12): Array<{ role: "user" | "assistant"; content: string }> {
+  getConversationSession(sessionId: string): ConversationSession | undefined {
+    const row = this.db.prepare("SELECT * FROM conversation_sessions WHERE id = ?").get(sessionId) as ConversationSessionRow | undefined;
+    return row ? mapConversationSession(row) : undefined;
+  }
+
+  listConversationSessions(params: { projectId: string; userId?: string; limit?: number; offset?: number; includeArchived?: boolean }): ConversationSession[] {
     const rows = this.db
       .prepare(
-        `SELECT role, content
-         FROM conversation_messages
-         WHERE session_id = ?
+        `SELECT * FROM conversation_sessions
+         WHERE project_id = ?
+           AND (? IS NULL OR user_id IS NULL OR user_id = ?)
+           AND (? = 1 OR status != 'archived')
+         ORDER BY COALESCE(last_message_at, updated_at) DESC, updated_at DESC
+         LIMIT ? OFFSET ?`
+      )
+      .all(params.projectId, params.userId ?? null, params.userId ?? null, params.includeArchived ? 1 : 0, params.limit ?? 30, params.offset ?? 0) as unknown as ConversationSessionRow[];
+    return rows.map(mapConversationSession);
+  }
+
+  updateConversationSession(params: { sessionId: string; title?: string; status?: ConversationSession["status"]; lastMessagePreview?: string; lastMessageAt?: string; archivedAt?: string | null }): ConversationSession | undefined {
+    const existing = this.getConversationSession(params.sessionId);
+    if (!existing) return undefined;
+    const updatedAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE conversation_sessions
+         SET title = COALESCE(?, title),
+             status = COALESCE(?, status),
+             last_message_preview = COALESCE(?, last_message_preview),
+             last_message_at = COALESCE(?, last_message_at),
+             archived_at = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        params.title ? normalizeTitle(params.title) : null,
+        params.status ?? null,
+        params.lastMessagePreview ?? null,
+        params.lastMessageAt ?? null,
+        params.archivedAt === undefined ? existing.archivedAt ?? null : params.archivedAt,
+        updatedAt,
+        params.sessionId
+      );
+    return this.getConversationSession(params.sessionId);
+  }
+
+  archiveConversationSession(sessionId: string): ConversationSession | undefined {
+    return this.updateConversationSession({ sessionId, status: "archived", archivedAt: new Date().toISOString() });
+  }
+
+  ensureConversationSession(params: { sessionId?: string; userId?: string; projectId: string; firstMessage?: string }): ConversationSession {
+    if (params.sessionId) {
+      const existing = this.getConversationSession(params.sessionId);
+      if (existing) return existing;
+    }
+    return this.createConversationSession({
+      id: params.sessionId,
+      userId: params.userId,
+      projectId: params.projectId,
+      title: params.firstMessage ? titleFromMessage(params.firstMessage) : "新对话"
+    });
+  }
+
+  insertMessage(params: Partial<ConversationMessage> & {
+    id: string;
+    sessionId: string;
+    role: "user" | "assistant" | "system";
+    content: string;
+    createdAt: string;
+  }): ConversationMessage {
+    const message: ConversationMessage = {
+      id: params.id,
+      sessionId: params.sessionId,
+      runId: params.runId,
+      role: params.role,
+      content: params.content,
+      contentType: params.contentType ?? "text",
+      metadata: params.metadata ?? {},
+      tokenEstimate: params.tokenEstimate ?? estimateTokens(params.content),
+      createdAt: params.createdAt
+    };
+    this.db
+      .prepare(
+        `INSERT INTO conversation_messages (id, session_id, run_id, role, content, content_type, metadata_json, token_estimate, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(message.id, message.sessionId, message.runId ?? null, message.role, message.content, message.contentType, JSON.stringify(message.metadata), message.tokenEstimate, message.createdAt);
+    this.updateConversationAfterMessage(message.sessionId, message);
+    return message;
+  }
+
+  listSessionMessages(sessionId: string, limit = 12): ConversationMessage[] {
+    return this.listConversationMessages({ sessionId, limit });
+  }
+
+  listConversationMessages(params: { sessionId: string; limit?: number; before?: string; after?: string }): ConversationMessage[] {
+    const clauses = ["session_id = ?"];
+    const args: Array<string | number | null> = [params.sessionId];
+    if (params.before) {
+      clauses.push("created_at < ?");
+      args.push(params.before);
+    }
+    if (params.after) {
+      clauses.push("created_at > ?");
+      args.push(params.after);
+    }
+    const limit = params.limit ?? 100;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM conversation_messages
+         WHERE ${clauses.join(" AND ")}
          ORDER BY created_at DESC
          LIMIT ?`
       )
-      .all(sessionId, limit) as Array<{ role: "user" | "assistant"; content: string }>;
+      .all(...args, limit) as unknown as ConversationMessageRow[];
+    return rows.reverse().map(mapConversationMessage);
+  }
 
-    return rows.reverse();
+  countConversationMessages(sessionId: string): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM conversation_messages WHERE session_id = ?").get(sessionId) as { count: number };
+    return Number(row.count);
+  }
+
+  updateConversationAfterMessage(sessionId: string, message: Pick<ConversationMessage, "content" | "createdAt">): void {
+    if (!this.getConversationSession(sessionId)) return;
+    const count = this.countConversationMessages(sessionId);
+    this.db
+      .prepare(
+        `UPDATE conversation_sessions
+         SET message_count = ?, last_message_preview = ?, last_message_at = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(count, previewText(message.content), message.createdAt, message.createdAt, sessionId);
+  }
+
+  insertConversationSummary(summary: ConversationSummary): ConversationSummary {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO conversation_summaries (id, session_id, project_id, user_id, from_message_id, to_message_id, message_count, summary_json, summary_text, model, token_estimate, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(summary.id, summary.sessionId, summary.projectId, summary.userId ?? null, summary.fromMessageId, summary.toMessageId, summary.messageCount, JSON.stringify(summary.summaryJson), summary.summaryText, summary.model, summary.tokenEstimate, summary.createdAt, summary.updatedAt);
+    return summary;
+  }
+
+  getLatestConversationSummary(sessionId: string): ConversationSummary | undefined {
+    const row = this.db.prepare("SELECT * FROM conversation_summaries WHERE session_id = ? ORDER BY updated_at DESC LIMIT 1").get(sessionId) as ConversationSummaryRow | undefined;
+    return row ? mapConversationSummary(row) : undefined;
+  }
+
+  listConversationSummaries(sessionId: string): ConversationSummary[] {
+    const rows = this.db.prepare("SELECT * FROM conversation_summaries WHERE session_id = ? ORDER BY updated_at DESC").all(sessionId) as unknown as ConversationSummaryRow[];
+    return rows.map(mapConversationSummary);
+  }
+
+  createCollectedItem(params: {
+    id?: string;
+    projectId: string;
+    userId?: string;
+    sessionId?: string;
+    kind: CollectedItemKind;
+    title: string;
+    source?: string;
+    status?: CollectedItem["status"];
+    documentId?: string;
+    contentHash?: string;
+    metadata?: Record<string, unknown>;
+  }): CollectedItem {
+    const now = new Date().toISOString();
+    const item: CollectedItem = {
+      id: params.id ?? cryptoRandomId(),
+      projectId: params.projectId,
+      userId: params.userId,
+      sessionId: params.sessionId,
+      kind: params.kind,
+      title: params.title,
+      source: params.source,
+      status: params.status ?? "pending",
+      documentId: params.documentId,
+      contentHash: params.contentHash,
+      metadata: params.metadata ?? {},
+      createdAt: now,
+      updatedAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO collected_items (id, project_id, user_id, session_id, kind, title, source, status, document_id, content_hash, metadata_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(item.id, item.projectId, item.userId ?? null, item.sessionId ?? null, item.kind, item.title, item.source ?? null, item.status, item.documentId ?? null, item.contentHash ?? null, JSON.stringify(item.metadata), item.createdAt, item.updatedAt);
+    return item;
+  }
+
+  updateCollectedItem(params: { id: string; status?: CollectedItem["status"]; documentId?: string; contentHash?: string; metadata?: Record<string, unknown> }): CollectedItem | undefined {
+    const existing = this.getCollectedItem(params.id);
+    if (!existing) return undefined;
+    const metadata = params.metadata ? { ...existing.metadata, ...params.metadata } : existing.metadata;
+    const updatedAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE collected_items
+         SET status = COALESCE(?, status), document_id = COALESCE(?, document_id), content_hash = COALESCE(?, content_hash), metadata_json = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(params.status ?? null, params.documentId ?? null, params.contentHash ?? null, JSON.stringify(metadata), updatedAt, params.id);
+    return this.getCollectedItem(params.id);
+  }
+
+  getCollectedItem(id: string): CollectedItem | undefined {
+    const row = this.db.prepare("SELECT * FROM collected_items WHERE id = ?").get(id) as CollectedItemRow | undefined;
+    return row ? mapCollectedItem(row) : undefined;
+  }
+
+  listCollectedItems(params: { projectId: string; userId?: string; limit?: number; offset?: number; status?: CollectedItem["status"] }): CollectedItem[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM collected_items
+         WHERE project_id = ?
+           AND (? IS NULL OR user_id IS NULL OR user_id = ?)
+           AND (? IS NULL OR status = ?)
+         ORDER BY updated_at DESC
+         LIMIT ? OFFSET ?`
+      )
+      .all(params.projectId, params.userId ?? null, params.userId ?? null, params.status ?? null, params.status ?? null, params.limit ?? 30, params.offset ?? 0) as unknown as CollectedItemRow[];
+    return rows.map(mapCollectedItem);
   }
 
   insertRouteLog(context: RequestContext, routePlan: RoutePlan): void {
@@ -586,15 +820,72 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, chunk_index);
 
+      CREATE TABLE IF NOT EXISTS conversation_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        message_count INTEGER NOT NULL,
+        last_message_preview TEXT,
+        last_message_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        archived_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_conversation_sessions_project_updated ON conversation_sessions(project_id, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_conversation_sessions_user_updated ON conversation_sessions(user_id, updated_at);
+
       CREATE TABLE IF NOT EXISTS conversation_messages (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
+        run_id TEXT,
         role TEXT NOT NULL,
         content TEXT NOT NULL,
+        content_type TEXT DEFAULT 'text',
+        metadata_json TEXT DEFAULT '{}',
+        token_estimate INTEGER DEFAULT 0,
         created_at TEXT NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_messages_session ON conversation_messages(session_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS conversation_summaries (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        user_id TEXT,
+        from_message_id TEXT NOT NULL,
+        to_message_id TEXT NOT NULL,
+        message_count INTEGER NOT NULL,
+        summary_json TEXT NOT NULL,
+        summary_text TEXT NOT NULL,
+        model TEXT NOT NULL,
+        token_estimate INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_conversation_summaries_session ON conversation_summaries(session_id, updated_at);
+
+      CREATE TABLE IF NOT EXISTS collected_items (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        user_id TEXT,
+        session_id TEXT,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        source TEXT,
+        status TEXT NOT NULL,
+        document_id TEXT,
+        content_hash TEXT,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_collected_items_project_updated ON collected_items(project_id, updated_at);
 
       CREATE TABLE IF NOT EXISTS session_state (
         session_id TEXT PRIMARY KEY,
@@ -679,7 +970,106 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id, started_at);
       CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, created_at);
     `);
+    this.addColumnIfMissing("conversation_messages", "run_id", "TEXT");
+    this.addColumnIfMissing("conversation_messages", "content_type", "TEXT DEFAULT 'text'");
+    this.addColumnIfMissing("conversation_messages", "metadata_json", "TEXT DEFAULT '{}'");
+    this.addColumnIfMissing("conversation_messages", "token_estimate", "INTEGER DEFAULT 0");
+    this.backfillConversationSessions();
   }
+
+  private backfillConversationSessions(): void {
+    try {
+      this.db.exec(`
+        INSERT OR IGNORE INTO conversation_sessions (id, user_id, project_id, title, status, message_count, last_message_preview, last_message_at, created_at, updated_at, archived_at)
+        SELECT
+          session_id,
+          NULL,
+          'default',
+          COALESCE(substr((SELECT content FROM conversation_messages cm2 WHERE cm2.session_id = cm.session_id AND cm2.role = 'user' ORDER BY created_at ASC LIMIT 1), 1, 30), '历史对话'),
+          'active',
+          COUNT(*),
+          substr((SELECT content FROM conversation_messages cm3 WHERE cm3.session_id = cm.session_id ORDER BY created_at DESC LIMIT 1), 1, 120),
+          MAX(created_at),
+          MIN(created_at),
+          MAX(created_at),
+          NULL
+        FROM conversation_messages cm
+        GROUP BY session_id
+      `);
+    } catch {
+      // Best-effort backfill for databases created before conversation_sessions existed.
+    }
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    try {
+      const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!rows.some((row) => row.name === column)) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+      }
+    } catch {
+      // Best-effort compatibility migration for older SQLite files.
+    }
+  }
+}
+
+
+interface ConversationSessionRow {
+  id: string;
+  user_id: string | null;
+  project_id: string;
+  title: string;
+  status: ConversationSession["status"];
+  message_count: number;
+  last_message_preview: string | null;
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+interface ConversationMessageRow {
+  id: string;
+  session_id: string;
+  run_id: string | null;
+  role: ConversationMessage["role"];
+  content: string;
+  content_type: ConversationMessage["contentType"] | null;
+  metadata_json: string | null;
+  token_estimate: number | null;
+  created_at: string;
+}
+
+interface ConversationSummaryRow {
+  id: string;
+  session_id: string;
+  project_id: string;
+  user_id: string | null;
+  from_message_id: string;
+  to_message_id: string;
+  message_count: number;
+  summary_json: string;
+  summary_text: string;
+  model: string;
+  token_estimate: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface CollectedItemRow {
+  id: string;
+  project_id: string;
+  user_id: string | null;
+  session_id: string | null;
+  kind: CollectedItemKind;
+  title: string;
+  source: string | null;
+  status: CollectedItem["status"];
+  document_id: string | null;
+  content_hash: string | null;
+  metadata_json: string;
+  created_at: string;
+  updated_at: string;
 }
 
 interface DocumentRow {
@@ -741,6 +1131,126 @@ interface ChunkJoinRow {
   title: string;
   source: string | null;
   project_id: string;
+}
+
+
+function mapConversationSession(row: ConversationSessionRow): ConversationSession {
+  return {
+    id: row.id,
+    userId: row.user_id ?? undefined,
+    projectId: row.project_id,
+    title: row.title,
+    status: row.status,
+    messageCount: row.message_count,
+    lastMessagePreview: row.last_message_preview ?? undefined,
+    lastMessageAt: row.last_message_at ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at ?? undefined
+  };
+}
+
+function mapConversationMessage(row: ConversationMessageRow): ConversationMessage {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    runId: row.run_id ?? undefined,
+    role: row.role,
+    content: row.content,
+    contentType: row.content_type ?? "text",
+    metadata: safeParseRecord(row.metadata_json),
+    tokenEstimate: row.token_estimate ?? estimateTokens(row.content),
+    createdAt: row.created_at
+  };
+}
+
+function mapConversationSummary(row: ConversationSummaryRow): ConversationSummary {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    projectId: row.project_id,
+    userId: row.user_id ?? undefined,
+    fromMessageId: row.from_message_id,
+    toMessageId: row.to_message_id,
+    messageCount: row.message_count,
+    summaryJson: safeParseCompressedContext(row.summary_json),
+    summaryText: row.summary_text,
+    model: row.model,
+    tokenEstimate: row.token_estimate,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapCollectedItem(row: CollectedItemRow): CollectedItem {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    userId: row.user_id ?? undefined,
+    sessionId: row.session_id ?? undefined,
+    kind: row.kind,
+    title: row.title,
+    source: row.source ?? undefined,
+    status: row.status,
+    documentId: row.document_id ?? undefined,
+    contentHash: row.content_hash ?? undefined,
+    metadata: safeParseRecord(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function cryptoRandomId(): string {
+  return randomUUID();
+}
+
+function normalizeTitle(title: string): string {
+  const normalized = title.replace(/\s+/g, " ").trim();
+  return normalized.length > 0 ? normalized.slice(0, 80) : "新对话";
+}
+
+function titleFromMessage(message: string): string {
+  return normalizeTitle(message.slice(0, 30));
+}
+
+function previewText(content: string): string {
+  return content.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+function safeParseCompressedContext(value: string | null): ConversationCompressedContext {
+  const parsed = safeParseRecord(value);
+  return {
+    userGoals: toStringArray(parsed.userGoals),
+    facts: toStringArray(parsed.facts),
+    decisions: toStringArray(parsed.decisions),
+    openQuestions: toStringArray(parsed.openQuestions),
+    referencedDocuments: Array.isArray(parsed.referencedDocuments)
+      ? parsed.referencedDocuments
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+          .map((item) => ({
+            documentId: typeof item.documentId === "string" ? item.documentId : undefined,
+            title: typeof item.title === "string" ? item.title : undefined,
+            source: typeof item.source === "string" ? item.source : undefined,
+            reason: typeof item.reason === "string" ? item.reason : ""
+          }))
+      : [],
+    userPreferences: toStringArray(parsed.userPreferences),
+    corrections: toStringArray(parsed.corrections),
+    workflowResults: toStringArray(parsed.workflowResults),
+    importantMessages: Array.isArray(parsed.importantMessages)
+      ? parsed.importantMessages
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+          .map((item) => ({
+            role: item.role === "assistant" || item.role === "system" ? item.role : "user",
+            content: typeof item.content === "string" ? item.content : "",
+            reason: typeof item.reason === "string" ? item.reason : ""
+          }))
+      : []
+  };
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function mapSessionState(row: SessionStateRow): SessionState {

@@ -33,6 +33,18 @@ export const builtInCapabilities: CapabilityDefinition[] = [
     requiresConfirmation: false
   },
   {
+    id: "workflow.ingest_collected_content",
+    kind: "workflow",
+    name: "采集信息入库",
+    description: "接收用户提供的内容，创建 collected_item，写入 documents/chunks，生成 embedding，写入 LanceDB，创建 memory anchor，并完成内容注册。",
+    examples: ["保存这段：标题：AI范式变化 ...", "采集这段内容", "保存到知识库"],
+    requiredParams: ["content"],
+    optionalParams: ["title", "source", "kind", "metadata", "projectId"],
+    riskLevel: "low",
+    costLevel: "low",
+    requiresConfirmation: false
+  },
+  {
     id: "workflow.ingest_text_database",
     kind: "workflow",
     name: "写入数据库",
