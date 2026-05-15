@@ -6,9 +6,11 @@ import { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
 import { buildFinalPrompt, defaultConstraints } from "./contextBuilder.js";
 import { extractQueryPayload, extractWritePayload, Router } from "./router.js";
 import { DocumentService } from "../services/documentService.js";
+import { extractWeChatArticleUrl, WeChatArticleWorkflow } from "../services/weChatArticleWorkflow.js";
 
 export class Orchestrator {
   private readonly router: Router;
+  private readonly wechatArticles: WeChatArticleWorkflow;
 
   constructor(
     private readonly config: AppConfig,
@@ -17,6 +19,7 @@ export class Orchestrator {
     private readonly ai: OpenAiCompatibleClient
   ) {
     this.router = new Router(ai, config.ai.routerModel);
+    this.wechatArticles = new WeChatArticleWorkflow(config.wespy);
   }
 
   async chat(input: { message: string; sessionId?: string; userId?: string; projectId?: string }): Promise<ChatResponse> {
@@ -71,6 +74,11 @@ export class Orchestrator {
       return undefined;
     }
 
+    const wechatUrl = stringParam(routePlan.extractedParams.url) || extractWeChatArticleUrl(context.message);
+    if (wechatUrl && routePlan.candidateCapabilities.includes("workflow.ingest_wechat_article")) {
+      return this.ingestWeChatArticle(context, wechatUrl);
+    }
+
     if (!routePlan.candidateCapabilities.includes("workflow.ingest_text_database")) {
       return {
         status: "skipped",
@@ -101,12 +109,55 @@ export class Orchestrator {
     });
   }
 
+  private async ingestWeChatArticle(context: RequestContext, url: string): Promise<ExecutionResult> {
+    try {
+      const article = await this.wechatArticles.fetchArticle(url);
+      const result = await this.documents.writeDocument({
+        title: article.title,
+        source: article.url,
+        projectId: context.projectId,
+        content: article.content,
+        metadata: {
+          requestId: context.requestId,
+          sessionId: context.sessionId,
+          workflow: "workflow.ingest_wechat_article",
+          author: article.author,
+          publishTime: article.publishTime,
+          markdownFile: article.markdownFile,
+          infoFile: article.infoFile,
+          wespyInfo: article.rawInfo
+        }
+      });
+
+      return {
+        status: "success",
+        capabilityId: "workflow.ingest_wechat_article",
+        message: "公众号文章已通过 WeSpy 获取，并写入 SQLite 与 LanceDB。",
+        output: {
+          documentId: result.document.id,
+          title: result.document.title,
+          source: result.document.source,
+          chunkCount: result.chunkCount,
+          author: article.author,
+          publishTime: article.publishTime
+        }
+      };
+    } catch (error) {
+      return {
+        status: "failed",
+        capabilityId: "workflow.ingest_wechat_article",
+        message: "公众号文章写入数据库失败。",
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
   private async retrieveIfNeeded(
     context: RequestContext,
     routePlan: RoutePlan,
     executionResult?: ExecutionResult
   ) {
-    if (!routePlan.needsRag || executionResult?.capabilityId === "workflow.ingest_text_database") {
+    if (!routePlan.needsRag || executionResult?.capabilityId?.startsWith("workflow.ingest_")) {
       return undefined;
     }
 
@@ -129,9 +180,13 @@ export class Orchestrator {
     executionResult?: ExecutionResult,
     evidencePack?: Awaited<ReturnType<DocumentService["search"]>>
   ): Promise<string> {
-    if (executionResult?.capabilityId === "workflow.ingest_text_database") {
+    if (
+      executionResult?.capabilityId === "workflow.ingest_text_database" ||
+      executionResult?.capabilityId === "workflow.ingest_wechat_article"
+    ) {
       if (executionResult.status === "success") {
-        return `已写入数据库。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(
+        const title = executionResult.output?.title ? `，标题：${String(executionResult.output.title)}` : "";
+        return `已写入数据库${title}。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(
           executionResult.output?.chunkCount
         )}。`;
       }

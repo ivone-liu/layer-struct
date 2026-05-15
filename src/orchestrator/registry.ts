@@ -2,6 +2,18 @@ import type { CapabilityDefinition } from "../types.js";
 
 export const capabilities: CapabilityDefinition[] = [
   {
+    id: "workflow.ingest_wechat_article",
+    kind: "workflow",
+    name: "保存公众号文章",
+    description: "通过 WeSpy 获取 mp.weixin.qq.com 公众号文章，提取 Markdown 内容后写入本地 SQLite 与 LanceDB。",
+    examples: ["保存公众号文章：https://mp.weixin.qq.com/s/xxxxx", "把这篇公众号文章入库 https://mp.weixin.qq.com/..."],
+    requiredParams: ["url"],
+    optionalParams: ["projectId"],
+    riskLevel: "low",
+    costLevel: "low",
+    requiresConfirmation: false
+  },
+  {
     id: "workflow.ingest_text_database",
     kind: "workflow",
     name: "写入数据库",

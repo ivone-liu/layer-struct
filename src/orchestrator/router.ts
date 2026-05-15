@@ -1,5 +1,6 @@
 import { parseJsonObject } from "../ai/json.js";
 import type { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
+import { extractWeChatArticleUrl } from "../services/weChatArticleWorkflow.js";
 import type { RequestContext, RoutePlan } from "../types.js";
 import { capabilities } from "./registry.js";
 
@@ -40,6 +41,7 @@ function routerSystemPrompt(): string {
 
 任务类型只能是 chat、rag_chat、skill_call、workflow。
 当用户要求保存、记录、入库、写入数据库时，选择 workflow。
+当用户消息中包含 https://mp.weixin.qq.com/ 开头链接，并要求保存/入库/记录公众号文章内容时，选择 workflow.ingest_wechat_article，并提取 url。
 当用户要求查询数据库、知识库、根据资料回答、检索资料时，选择 rag_chat 或 skill_call。
 普通解释、写作、分析且不依赖资料时，选择 chat。
 
@@ -64,6 +66,27 @@ ${capabilities.map((capability) => `- ${capability.id}: ${capability.description
 }
 
 function routeByRules(message: string): RoutePlan {
+  const wechatUrl = extractWeChatArticleUrl(message);
+  if (wechatUrl && hasWriteIntent(message)) {
+    return normalizeRoutePlan(
+      {
+        taskType: "workflow",
+        needsRag: false,
+        needsMemory: false,
+        needsSkill: false,
+        needsWorkflow: true,
+        capabilityQuery: "保存公众号文章 WeSpy 微信文章入库",
+        searchQueries: [],
+        candidateCapabilities: ["workflow.ingest_wechat_article"],
+        extractedParams: { url: wechatUrl },
+        missingParams: [],
+        confidence: 0.92,
+        rationale: "规则识别到公众号文章链接和保存/入库意图。"
+      },
+      message
+    );
+  }
+
   const writePayload = extractWritePayload(message);
   if (writePayload) {
     return normalizeRoutePlan(
@@ -126,8 +149,12 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
   const taskType = ["chat", "rag_chat", "skill_call", "workflow"].includes(plan.taskType) ? plan.taskType : "chat";
   const searchQueries = Array.isArray(plan.searchQueries) ? plan.searchQueries.filter(Boolean) : [];
   const candidateCapabilities = Array.isArray(plan.candidateCapabilities) ? plan.candidateCapabilities : [];
+  const wechatUrl = extractWeChatArticleUrl(message);
+  if (taskType === "workflow" && wechatUrl && !candidateCapabilities.includes("workflow.ingest_wechat_article")) {
+    candidateCapabilities.unshift("workflow.ingest_wechat_article");
+  }
   if (taskType === "workflow" && candidateCapabilities.length === 0) {
-    candidateCapabilities.push("workflow.ingest_text_database");
+    candidateCapabilities.push(wechatUrl ? "workflow.ingest_wechat_article" : "workflow.ingest_text_database");
   }
   if ((taskType === "rag_chat" || taskType === "skill_call") && candidateCapabilities.length === 0) {
     candidateCapabilities.push("skill.query_database");
@@ -142,15 +169,23 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
     capabilityQuery: plan.capabilityQuery ?? "",
     searchQueries: searchQueries.length > 0 ? searchQueries : taskType === "rag_chat" ? [message] : [],
     candidateCapabilities,
-    extractedParams: plan.extractedParams && typeof plan.extractedParams === "object" ? plan.extractedParams : {},
+    extractedParams: normalizeExtractedParams(plan.extractedParams, wechatUrl),
     missingParams: Array.isArray(plan.missingParams) ? plan.missingParams : [],
     confidence: clamp(Number(plan.confidence) || 0.5, 0, 1),
     rationale: plan.rationale
   };
 }
 
+function normalizeExtractedParams(params: unknown, wechatUrl?: string): Record<string, unknown> {
+  const normalized = params && typeof params === "object" ? { ...(params as Record<string, unknown>) } : {};
+  if (wechatUrl && typeof normalized.url !== "string") {
+    normalized.url = wechatUrl;
+  }
+  return normalized;
+}
+
 export function extractWritePayload(message: string): { title: string; content: string; source?: string } | undefined {
-  if (!/(写入数据库|保存到数据库|保存这段|入库|记录到知识库|保存到知识库)/.test(message)) {
+  if (!hasWriteIntent(message) || extractWeChatArticleUrl(message)) {
     return undefined;
   }
 
@@ -191,4 +226,8 @@ export function extractQueryPayload(message: string): string | undefined {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function hasWriteIntent(message: string): boolean {
+  return /(写入数据库|保存到数据库|保存这段|保存|入库|记录到知识库|保存到知识库|公众号文章)/u.test(message);
 }
