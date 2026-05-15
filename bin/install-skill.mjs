@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -28,10 +28,13 @@ if (!existsSync(skillMd)) {
 const manifest = parseFrontmatter(readFileSync(skillMd, "utf8"));
 const name = toKebabCase(explicitName ?? manifest.name ?? path.basename(sourceDir));
 const destination = path.join(skillsDir, name);
-if (existsSync(destination)) {
-  rmSync(destination, { recursive: true, force: true });
+const sourceIsDestination = pathsReferToSameEntry(sourceDir, destination);
+if (!sourceIsDestination) {
+  if (existsSync(destination)) {
+    rmSync(destination, { recursive: true, force: true });
+  }
+  cpSync(sourceDir, destination, { recursive: true });
 }
-cpSync(sourceDir, destination, { recursive: true });
 
 const registry = readRegistry(registryPath);
 registry.skills = (registry.skills ?? []).filter((entry) => entry.name !== name && entry.path !== name);
@@ -71,6 +74,18 @@ function resolveSourceDir(value, tempDirs) {
 
   console.error(`Unsupported source: ${value}`);
   process.exit(1);
+}
+
+function pathsReferToSameEntry(left, right) {
+  if (!existsSync(left) || !existsSync(right)) {
+    return false;
+  }
+  return normalizePath(realpathSync(left)) === normalizePath(realpathSync(right));
+}
+
+function normalizePath(value) {
+  const normalized = path.normalize(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function readRegistry(filePath) {
