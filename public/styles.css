@@ -303,3 +303,67 @@ pre {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+
+.assistant-composite {
+  display: grid;
+  gap: 12px;
+  width: min(680px, 88%);
+  max-width: min(680px, 88%);
+}
+
+.run-progress {
+  display: grid;
+  gap: 7px;
+  color: #526377;
+  font-size: 13px;
+  white-space: normal;
+}
+
+.progress-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
+.progress-dot {
+  width: 9px;
+  height: 9px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: #9aa8ba;
+}
+
+.progress-item[data-state="running"] .progress-dot {
+  background: #1f6feb;
+  box-shadow: 0 0 0 4px rgba(31, 111, 235, 0.12);
+}
+
+.progress-item[data-state="done"] .progress-dot {
+  background: #2da66f;
+}
+
+.progress-item[data-state="failed"] .progress-dot {
+  background: #d1242f;
+}
+
+.progress-item[data-state="running"] .progress-text {
+  color: #1f4f91;
+}
+
+.progress-item[data-state="done"] .progress-text {
+  color: #526377;
+}
+
+.progress-item[data-state="failed"] .progress-text {
+  color: #a40e26;
+}
+
+.answer:empty {
+  display: none;
+}
+
+.answer:not(:empty) {
+  padding-top: 4px;
+  border-top: 1px solid #d7e0eb;
+}

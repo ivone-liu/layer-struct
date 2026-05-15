@@ -1,7 +1,17 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { EvidenceItem, RequestContext, RoutePlan, StoredChunk, StoredDocument, StoredDocumentInput } from "../types.js";
+import type {
+  EvidenceItem,
+  RequestContext,
+  RoutePlan,
+  RunStatus,
+  RunStepName,
+  RunStepStatus,
+  StoredChunk,
+  StoredDocument,
+  StoredDocumentInput
+} from "../types.js";
 
 export class SqliteStore {
   private readonly db: DatabaseSync;
@@ -178,6 +188,130 @@ export class SqliteStore {
       );
   }
 
+
+  createRun(params: {
+    id: string;
+    sessionId: string;
+    projectId: string;
+    userMessage: string;
+    status: RunStatus;
+    createdAt: string;
+    updatedAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO runs (id, session_id, project_id, user_message, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        params.id,
+        params.sessionId,
+        params.projectId,
+        params.userMessage,
+        params.status,
+        params.createdAt,
+        params.updatedAt
+      );
+  }
+
+  updateRunStatus(id: string, status: RunStatus, updatedAt = new Date().toISOString()): void {
+    this.db.prepare(`UPDATE runs SET status = ?, updated_at = ? WHERE id = ?`).run(status, updatedAt, id);
+  }
+
+  insertRunStep(params: {
+    id: string;
+    runId: string;
+    stepName: RunStepName;
+    status: RunStepStatus;
+    visibleMessage?: string;
+    debug?: Record<string, unknown>;
+    startedAt?: string;
+    endedAt?: string;
+    error?: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO run_steps (id, run_id, step_name, status, visible_message, debug_json, started_at, ended_at, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        params.id,
+        params.runId,
+        params.stepName,
+        params.status,
+        params.visibleMessage ?? null,
+        JSON.stringify(params.debug ?? {}),
+        params.startedAt ?? null,
+        params.endedAt ?? null,
+        params.error ?? null
+      );
+  }
+
+  updateRunStep(
+    id: string,
+    params: {
+      status?: RunStepStatus;
+      visibleMessage?: string;
+      debug?: Record<string, unknown>;
+      startedAt?: string;
+      endedAt?: string;
+      error?: string;
+    }
+  ): void {
+    const existing = this.db.prepare(`SELECT debug_json FROM run_steps WHERE id = ?`).get(id) as
+      | { debug_json: string }
+      | undefined;
+    if (!existing) {
+      return;
+    }
+
+    const currentDebug = safeParseRecord(existing.debug_json);
+    const nextDebug = params.debug ? { ...currentDebug, ...params.debug } : currentDebug;
+    this.db
+      .prepare(
+        `UPDATE run_steps
+         SET status = COALESCE(?, status),
+             visible_message = COALESCE(?, visible_message),
+             debug_json = ?,
+             started_at = COALESCE(?, started_at),
+             ended_at = COALESCE(?, ended_at),
+             error = COALESCE(?, error)
+         WHERE id = ?`
+      )
+      .run(
+        params.status ?? null,
+        params.visibleMessage ?? null,
+        JSON.stringify(nextDebug),
+        params.startedAt ?? null,
+        params.endedAt ?? null,
+        params.error ?? null,
+        id
+      );
+  }
+
+  insertRunEvent(params: {
+    id: string;
+    runId: string;
+    eventType: string;
+    visibleMessage?: string;
+    payload: Record<string, unknown>;
+    createdAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO run_events (id, run_id, event_type, visible_message, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        params.id,
+        params.runId,
+        params.eventType,
+        params.visibleMessage ?? null,
+        JSON.stringify(params.payload),
+        params.createdAt
+      );
+  }
+
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS documents (
@@ -221,6 +355,43 @@ export class SqliteStore {
         route_plan_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        user_message TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS run_steps (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        step_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        visible_message TEXT,
+        debug_json TEXT,
+        started_at TEXT,
+        ended_at TEXT,
+        error TEXT,
+        FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS run_events (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        visible_message TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id, started_at);
+      CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, created_at);
     `);
   }
 }
@@ -283,4 +454,16 @@ function escapeLike(value: string): string {
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+function safeParseRecord(value: string | null): Record<string, unknown> {
+  if (!value) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }

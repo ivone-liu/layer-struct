@@ -4,6 +4,7 @@ import { SqliteStore } from "../storage/sqliteStore.js";
 import type {
   ChatResponse,
   ChatStreamCallbacks,
+  DocumentWriteProgressEvent,
   ExecutionResult,
   EvidencePack,
   RequestContext,
@@ -15,6 +16,7 @@ import { buildFinalPrompt, defaultConstraints } from "./contextBuilder.js";
 import { extractQueryPayload, extractWritePayload, Router } from "./router.js";
 import { DocumentService } from "../services/documentService.js";
 import { extractWeChatArticleUrl, WeChatArticleWorkflow } from "../services/weChatArticleWorkflow.js";
+import { RunTracker } from "./runTracker.js";
 
 export class Orchestrator {
   private readonly router: Router;
@@ -76,40 +78,76 @@ export class Orchestrator {
       createdAt: context.createdAt
     });
 
-    const immediateReply = buildImmediateReply(context.message);
-    await callbacks.onEvent({ type: "assistant_delta", content: immediateReply });
-    await callbacks.onEvent({ type: "status", message: "执行中..." });
-
-    const routePlan = await this.router.route(context);
-    this.sqlite.insertRouteLog(context, routePlan);
-
-    const executionResult = await this.executeIfNeeded(context, routePlan);
-    const evidencePack = await this.retrieveIfNeeded(context, routePlan, executionResult);
-    await callbacks.onEvent({ type: "metadata", routePlan, evidencePack, executionResult });
-
-    let finalAnswer = "";
-    for await (const chunk of this.generateAnswerStream(context, routePlan, executionResult, evidencePack)) {
-      finalAnswer += chunk;
-      await callbacks.onEvent({ type: "assistant_delta", content: chunk });
-    }
-
-    const answer = `${immediateReply}${finalAnswer}`;
-    this.sqlite.insertMessage({
-      id: randomUUID(),
+    const runId = randomUUID();
+    this.sqlite.createRun({
+      id: runId,
       sessionId: context.sessionId,
-      role: "assistant",
-      content: answer,
-      createdAt: new Date().toISOString()
+      projectId: context.projectId,
+      userMessage: context.message,
+      status: "running",
+      createdAt: context.createdAt,
+      updatedAt: context.createdAt
     });
+    const tracker = new RunTracker(this.sqlite, callbacks, runId);
 
-    const result = {
-      answer,
-      routePlan,
-      evidencePack,
-      executionResult
-    };
-    await callbacks.onEvent({ type: "done", ...result });
-    return result;
+    let routePlan: RoutePlan | undefined;
+    let executionResult: ExecutionResult | undefined;
+    let evidencePack: EvidencePack | undefined;
+    let finalAnswer = "";
+
+    try {
+      await tracker.runStarted("已收到问题，正在判断处理方式。");
+      await tracker.stepCompleted("intake", "问题已进入 Orchestrator。", {
+        requestId: context.requestId,
+        sessionId: context.sessionId,
+        projectId: context.projectId
+      });
+
+      await tracker.stepStarted("router", "正在判断这是普通对话、资料查询还是工作流任务。");
+      routePlan = await this.router.route(context);
+      this.sqlite.insertRouteLog(context, routePlan);
+      await tracker.stepCompleted("router", renderRouteMessage(routePlan), { routePlan });
+
+      executionResult = await this.executeIfNeeded(context, routePlan, tracker);
+      evidencePack = await this.retrieveIfNeeded(context, routePlan, executionResult, tracker);
+
+      await tracker.stepStarted("context", "正在整理证据和上下文。");
+      const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack);
+      await tracker.stepCompleted("context", "上下文已整理完成。", {
+        hasEvidence: Boolean(evidencePack),
+        evidenceCount: evidencePack?.items.length ?? 0,
+        hasExecutionResult: Boolean(executionResult)
+      });
+
+      await tracker.metadata({ routePlan, evidencePack, executionResult });
+
+      await tracker.stepStarted("generation", "正在生成最终回答。");
+      for await (const chunk of this.generateAnswerStreamFromPrepared(generationInput)) {
+        finalAnswer += chunk;
+        await tracker.answerDelta(chunk);
+      }
+      await tracker.stepCompleted("generation", "回答生成完成。", { answerLength: finalAnswer.length });
+
+      this.sqlite.insertMessage({
+        id: randomUUID(),
+        sessionId: context.sessionId,
+        role: "assistant",
+        content: finalAnswer,
+        createdAt: new Date().toISOString()
+      });
+
+      const result = {
+        answer: finalAnswer,
+        routePlan,
+        evidencePack,
+        executionResult
+      };
+      await tracker.done(result);
+      return result;
+    } catch (error) {
+      await tracker.error(error);
+      throw error;
+    }
   }
 
   async writeDocument(input: StoredDocumentInput): Promise<ExecutionResult> {
@@ -126,14 +164,25 @@ export class Orchestrator {
     };
   }
 
-  private async executeIfNeeded(context: RequestContext, routePlan: RoutePlan): Promise<ExecutionResult | undefined> {
+  private async executeIfNeeded(
+    context: RequestContext,
+    routePlan: RoutePlan,
+    tracker?: RunTracker
+  ): Promise<ExecutionResult | undefined> {
     if (!routePlan.needsWorkflow && routePlan.taskType !== "workflow") {
       return undefined;
     }
 
     const wechatUrl = stringParam(routePlan.extractedParams.url) || extractWeChatArticleUrl(context.message);
     if (wechatUrl && routePlan.candidateCapabilities.includes("workflow.ingest_wechat_article")) {
-      return this.ingestWeChatArticle(context, wechatUrl);
+      await tracker?.stepStarted("execution", "正在抓取公众号文章内容。", { capabilityId: "workflow.ingest_wechat_article" });
+      const result = await this.ingestWeChatArticle(context, wechatUrl, tracker);
+      if (result.status === "failed") {
+        await tracker?.stepFailed("execution", "公众号文章写入数据库失败。", result.error ?? result.message, { result });
+      } else {
+        await tracker?.stepCompleted("execution", "公众号文章已写入知识库。", { result });
+      }
+      return result;
     }
 
     if (!routePlan.candidateCapabilities.includes("workflow.ingest_text_database")) {
@@ -143,58 +192,72 @@ export class Orchestrator {
       };
     }
 
+    await tracker?.stepStarted("execution", "正在整理并写入知识库。", { capabilityId: "workflow.ingest_text_database" });
     const parsed = extractWritePayload(context.message);
     const content = stringParam(routePlan.extractedParams.content) || parsed?.content;
     if (!content) {
-      return {
+      const result: ExecutionResult = {
         status: "failed",
         capabilityId: "workflow.ingest_text_database",
         message: "写入数据库缺少 content 参数。",
         error: "missing content"
       };
+      await tracker?.stepFailed("execution", "写入知识库失败，缺少可写入内容。", result.error, { result });
+      return result;
     }
 
-    return this.writeDocument({
-      title: stringParam(routePlan.extractedParams.title) || parsed?.title || "未命名资料",
-      source: stringParam(routePlan.extractedParams.source) || parsed?.source,
-      projectId: context.projectId,
-      content,
-      metadata: {
-        requestId: context.requestId,
-        sessionId: context.sessionId
-      }
-    });
-  }
-
-  private async ingestWeChatArticle(context: RequestContext, url: string): Promise<ExecutionResult> {
-    try {
-      const article = await this.wechatArticles.fetchArticle(url);
-      const result = await this.documents.writeDocument({
-        title: article.title,
-        source: article.url,
+    const result = await this.writeDocumentWithProgress(
+      {
+        title: stringParam(routePlan.extractedParams.title) || parsed?.title || "未命名资料",
+        source: stringParam(routePlan.extractedParams.source) || parsed?.source,
         projectId: context.projectId,
-        content: article.content,
+        content,
         metadata: {
           requestId: context.requestId,
-          sessionId: context.sessionId,
-          workflow: "workflow.ingest_wechat_article",
-          author: article.author,
-          publishTime: article.publishTime,
-          markdownFile: article.markdownFile,
-          infoFile: article.infoFile,
-          wespyInfo: article.rawInfo
+          sessionId: context.sessionId
         }
-      });
+      },
+      tracker
+    );
+    await tracker?.stepCompleted("execution", "资料已写入知识库。", { result });
+    return result;
+  }
+
+  private async ingestWeChatArticle(context: RequestContext, url: string, tracker?: RunTracker): Promise<ExecutionResult> {
+    try {
+      const article = await this.wechatArticles.fetchArticle(url);
+      await tracker?.metadata(
+        { progress: { type: "wechat_article_fetched", url, title: article.title } },
+        "文章内容已获取，正在写入知识库。"
+      );
+      const result = await this.writeDocumentWithProgress(
+        {
+          title: article.title,
+          source: article.url,
+          projectId: context.projectId,
+          content: article.content,
+          metadata: {
+            requestId: context.requestId,
+            sessionId: context.sessionId,
+            workflow: "workflow.ingest_wechat_article",
+            author: article.author,
+            publishTime: article.publishTime,
+            markdownFile: article.markdownFile,
+            infoFile: article.infoFile,
+            wespyInfo: article.rawInfo
+          }
+        },
+        tracker,
+        "workflow.ingest_wechat_article"
+      );
 
       return {
-        status: "success",
+        ...result,
         capabilityId: "workflow.ingest_wechat_article",
         message: "公众号文章已通过 WeSpy 获取，并写入 SQLite 与 LanceDB。",
         output: {
-          documentId: result.document.id,
-          title: result.document.title,
-          source: result.document.source,
-          chunkCount: result.chunkCount,
+          ...result.output,
+          source: article.url,
           author: article.author,
           publishTime: article.publishTime
         }
@@ -209,10 +272,31 @@ export class Orchestrator {
     }
   }
 
+  private async writeDocumentWithProgress(
+    input: StoredDocumentInput,
+    tracker?: RunTracker,
+    capabilityId = "workflow.ingest_text_database"
+  ): Promise<ExecutionResult> {
+    const result = await this.documents.writeDocument(input, async (event) => {
+      await tracker?.metadata({ progress: event }, documentProgressMessage(event));
+    });
+    return {
+      status: "success",
+      capabilityId,
+      message: "文档已写入 SQLite 与 LanceDB。",
+      output: {
+        documentId: result.document.id,
+        title: result.document.title,
+        chunkCount: result.chunkCount
+      }
+    };
+  }
+
   private async retrieveIfNeeded(
     context: RequestContext,
     routePlan: RoutePlan,
-    executionResult?: ExecutionResult
+    executionResult?: ExecutionResult,
+    tracker?: RunTracker
   ) {
     if (!routePlan.needsRag || executionResult?.capabilityId?.startsWith("workflow.ingest_")) {
       return undefined;
@@ -224,12 +308,20 @@ export class Orchestrator {
       extractQueryPayload(context.message) ||
       context.message;
 
-    return this.documents.search({
+    await tracker?.stepStarted("retrieval", "正在检索资料库。", { query, skillId: selectRetrievalSkill(routePlan) });
+    const evidencePack = await this.documents.search({
       query,
       projectId: context.projectId,
       limit: 6,
       skillId: selectRetrievalSkill(routePlan)
     });
+    const count = evidencePack.items.length;
+    await tracker?.stepCompleted("retrieval", count > 0 ? `已找到 ${count} 条相关资料。` : "没有找到足够相关资料。", {
+      query,
+      count,
+      skillId: evidencePack.skillId
+    });
+    return evidencePack;
   }
 
   private async generateAnswer(
@@ -238,55 +330,38 @@ export class Orchestrator {
     executionResult?: ExecutionResult,
     evidencePack?: EvidencePack
   ): Promise<string> {
-    if (
-      executionResult?.capabilityId === "workflow.ingest_text_database" ||
-      executionResult?.capabilityId === "workflow.ingest_wechat_article"
-    ) {
-      return this.renderWorkflowAnswer(executionResult);
+    const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack);
+    if (generationInput.kind === "static") {
+      return generationInput.answer;
     }
-
-    if (!this.ai.canChat(this.config.ai.chatModel)) {
-      if (evidencePack) {
-        return renderEvidenceFallback(evidencePack.items);
-      }
-      return "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。";
-    }
-
-    const history = this.sqlite.listSessionMessages(context.sessionId, 8);
-    const prompt = buildFinalPrompt({
-      request: context,
-      routePlan,
-      evidencePack,
-      executionResult,
-      constraints: defaultConstraints()
-    });
 
     return this.ai.chat({
       model: this.config.ai.chatModel,
       temperature: 0.3,
-      messages: buildFinalMessages(history, prompt)
+      messages: buildFinalMessages(generationInput.history, generationInput.prompt)
     });
   }
 
-  private async *generateAnswerStream(
+  private prepareGenerationInput(
     context: RequestContext,
     routePlan: RoutePlan,
     executionResult?: ExecutionResult,
     evidencePack?: EvidencePack
-  ): AsyncGenerator<string> {
+  ): GenerationInput {
     if (
       executionResult?.capabilityId === "workflow.ingest_text_database" ||
       executionResult?.capabilityId === "workflow.ingest_wechat_article"
     ) {
-      yield this.renderWorkflowAnswer(executionResult);
-      return;
+      return { kind: "static", answer: this.renderWorkflowAnswer(executionResult) };
     }
 
     if (!this.ai.canChat(this.config.ai.chatModel)) {
-      yield evidencePack
-        ? renderEvidenceFallback(evidencePack.items)
-        : "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。";
-      return;
+      return {
+        kind: "static",
+        answer: evidencePack
+          ? renderEvidenceFallback(evidencePack.items)
+          : "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。"
+      };
     }
 
     const history = this.sqlite.listSessionMessages(context.sessionId, 8);
@@ -297,11 +372,19 @@ export class Orchestrator {
       executionResult,
       constraints: defaultConstraints()
     });
+    return { kind: "model", history, prompt };
+  }
+
+  private async *generateAnswerStreamFromPrepared(generationInput: GenerationInput): AsyncGenerator<string> {
+    if (generationInput.kind === "static") {
+      yield generationInput.answer;
+      return;
+    }
 
     for await (const chunk of this.ai.streamChat({
       model: this.config.ai.chatModel,
       temperature: 0.3,
-      messages: buildFinalMessages(history, prompt)
+      messages: buildFinalMessages(generationInput.history, generationInput.prompt)
     })) {
       yield chunk;
     }
@@ -318,7 +401,11 @@ export class Orchestrator {
   }
 }
 
-function buildFinalMessages(history: Array<{ role: "system" | "user" | "assistant"; content: string }>, prompt: string) {
+type GenerationInput =
+  | { kind: "static"; answer: string }
+  | { kind: "model"; history: Array<{ role: "user" | "assistant"; content: string }>; prompt: string };
+
+function buildFinalMessages(history: Array<{ role: "user" | "assistant"; content: string }>, prompt: string) {
   return [
     {
       role: "system" as const,
@@ -327,20 +414,6 @@ function buildFinalMessages(history: Array<{ role: "system" | "user" | "assistan
     ...history,
     { role: "user" as const, content: prompt }
   ];
-}
-
-function buildImmediateReply(message: string): string {
-  const normalized = message.trim();
-  if (extractWeChatArticleUrl(normalized)) {
-    return "收到，我会先处理这篇公众号文章，并进入 Orchestrator 执行写入流程。\n\n执行中...\n\n";
-  }
-  if (/写入|存入|保存|入库|记录/.test(normalized)) {
-    return "收到，我会先按你的要求整理内容，并进入 Orchestrator 执行写入流程。\n\n执行中...\n\n";
-  }
-  if (/查询|检索|搜索|数据库|知识库|资料库/.test(normalized)) {
-    return "收到，我会先按你的问题去资料库检索，再基于证据组织回答。\n\n执行中...\n\n";
-  }
-  return "收到，我先理解你的问题，并进入 Orchestrator 继续处理。\n\n执行中...\n\n";
 }
 
 function createRequestContext(
@@ -366,6 +439,34 @@ function selectRetrievalSkill(routePlan: RoutePlan): string {
 
 function stringParam(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function renderRouteMessage(routePlan: RoutePlan): string {
+  if (routePlan.needsWorkflow || routePlan.taskType === "workflow") {
+    if (routePlan.candidateCapabilities.includes("workflow.ingest_wechat_article")) {
+      return "判断完成：需要抓取公众号文章并写入知识库。";
+    }
+    return "判断完成：需要执行资料写入流程。";
+  }
+  if (routePlan.needsRag) {
+    return "判断完成：需要检索资料库后回答。";
+  }
+  return "判断完成：这是普通对话，将直接生成回答。";
+}
+
+function documentProgressMessage(event: DocumentWriteProgressEvent): string {
+  switch (event.type) {
+    case "document_created":
+      return "文档记录已创建。";
+    case "chunks_created":
+      return `已完成切片，共 ${event.chunkCount} 段。`;
+    case "embedding_started":
+      return "正在生成向量表示。";
+    case "embedding_progress":
+      return `向量生成进度：${event.completed}/${event.total}。`;
+    case "vectors_written":
+      return `向量已写入，共 ${event.vectorCount} 条。`;
+  }
 }
 
 function renderEvidenceFallback(items: Array<{ title: string; content: string; source?: string }>): string {

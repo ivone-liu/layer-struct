@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
 import { LanceVectorStore } from "../storage/lanceVectorStore.js";
 import { SqliteStore } from "../storage/sqliteStore.js";
-import type { EvidencePack, StoredDocument, StoredDocumentInput } from "../types.js";
+import type { DocumentWriteProgressEvent, EvidencePack, StoredDocument, StoredDocumentInput } from "../types.js";
 
 export class DocumentService {
   constructor(
@@ -11,7 +11,10 @@ export class DocumentService {
     private readonly ai: OpenAiCompatibleClient
   ) {}
 
-  async writeDocument(input: StoredDocumentInput): Promise<{ document: StoredDocument; chunkCount: number }> {
+  async writeDocument(
+    input: StoredDocumentInput,
+    onProgress?: (event: DocumentWriteProgressEvent) => void | Promise<void>
+  ): Promise<{ document: StoredDocument; chunkCount: number }> {
     const createdAt = new Date().toISOString();
     const documentId = randomUUID();
     const chunks = chunkText(input.content);
@@ -21,32 +24,45 @@ export class DocumentService {
       id: documentId,
       createdAt
     });
+    await onProgress?.({ type: "document_created", documentId, title: input.title, chunkCount: chunks.length });
 
+    const chunkRecords = chunks.map((content, index) => ({
+      id: randomUUID(),
+      documentId,
+      chunkIndex: index,
+      content,
+      createdAt
+    }));
+
+    for (const chunk of chunkRecords) {
+      this.sqlite.insertChunk(chunk);
+    }
+    await onProgress?.({ type: "chunks_created", documentId, chunkCount: chunkRecords.length });
+
+    await onProgress?.({ type: "embedding_started", documentId, chunkCount: chunkRecords.length });
     const vectorRecords = [];
-    for (const [index, content] of chunks.entries()) {
-      const chunkId = randomUUID();
-      this.sqlite.insertChunk({
-        id: chunkId,
-        documentId,
-        chunkIndex: index,
-        content,
-        createdAt
-      });
-
-      const vector = await this.ai.embed(content);
+    const progressInterval = embeddingProgressInterval(chunkRecords.length);
+    for (const [index, chunk] of chunkRecords.entries()) {
+      const vector = await this.ai.embed(chunk.content);
       vectorRecords.push({
-        id: chunkId,
-        chunkId,
+        id: chunk.id,
+        chunkId: chunk.id,
         documentId,
         projectId: input.projectId,
         title: input.title,
         source: input.source ?? "",
-        text: content,
+        text: chunk.content,
         vector
       });
+
+      const completed = index + 1;
+      if (completed === chunkRecords.length || completed % progressInterval === 0) {
+        await onProgress?.({ type: "embedding_progress", documentId, completed, total: chunkRecords.length });
+      }
     }
 
     await this.vectors.addChunks(vectorRecords);
+    await onProgress?.({ type: "vectors_written", documentId, vectorCount: vectorRecords.length });
     return { document, chunkCount: chunks.length };
   }
 
@@ -127,4 +143,11 @@ function withOverlap(text: string, overlapChars: number): string {
     return text;
   }
   return text.slice(text.length - overlapChars);
+}
+
+function embeddingProgressInterval(total: number): number {
+  if (total <= 0) {
+    return 1;
+  }
+  return Math.max(5, Math.ceil(total * 0.2));
 }
