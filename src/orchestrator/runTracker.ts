@@ -72,6 +72,10 @@ export class RunTracker {
     });
   }
 
+  async event(event: ChatStreamEvent): Promise<void> {
+    await this.emit(event);
+  }
+
   async metadata(payload: Record<string, unknown>, visibleMessage?: string): Promise<void> {
     await this.emit({
       type: "metadata",

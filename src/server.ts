@@ -8,6 +8,8 @@ import { Orchestrator } from "./orchestrator/orchestrator.js";
 import { formatUserFacingError } from "./orchestrator/runTracker.js";
 import { DocumentService } from "./services/documentService.js";
 import { MemoryService } from "./services/memoryService.js";
+import { ConversationService } from "./services/conversationService.js";
+import { CollectedContentWorkflow } from "./services/collectedContentWorkflow.js";
 import { LanceVectorStore } from "./storage/lanceVectorStore.js";
 import { SqliteStore } from "./storage/sqliteStore.js";
 import type { ChatStreamEvent, StoredDocumentInput } from "./types.js";
@@ -20,6 +22,8 @@ const ai = new OpenAiCompatibleClient(config.ai);
 const vectors = new LanceVectorStore(config.lanceDbUri, config.lanceDbDocumentTable);
 const documents = new DocumentService(sqlite, vectors, ai, config);
 const memory = new MemoryService(sqlite, vectors, ai, config);
+const conversations = new ConversationService(sqlite);
+const collectedWorkflow = new CollectedContentWorkflow(sqlite, documents, memory);
 const orchestrator = new Orchestrator(config, sqlite, documents, ai, memory);
 
 const publicDir = path.resolve(process.cwd(), "public");
@@ -50,6 +54,78 @@ const server = createServer(async (request, response) => {
           lanceDbCapabilityTable: config.lanceDbCapabilityTable
         }
       });
+    }
+
+
+    if (request.method === "GET" && url.pathname === "/api/conversations") {
+      const result = conversations.listSessions({
+        projectId: url.searchParams.get("projectId") || config.defaultProjectId,
+        userId: url.searchParams.get("userId") || undefined,
+        limit: Number(url.searchParams.get("limit") || 30),
+        offset: Number(url.searchParams.get("offset") || 0),
+        includeArchived: url.searchParams.get("includeArchived") === "true"
+      });
+      return json(response, 200, { conversations: result });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/conversations") {
+      const body = await readJsonBody<{ projectId?: string; userId?: string; title?: string }>(request);
+      const conversation = conversations.createSession({ projectId: body.projectId || config.defaultProjectId, userId: body.userId, title: body.title || "新对话" });
+      return json(response, 200, { conversation });
+    }
+
+    const conversationMatch = url.pathname.match(/^\/api\/conversations\/([^/]+)(?:\/(messages|archive))?$/);
+    if (conversationMatch) {
+      const sessionId = decodeURIComponent(conversationMatch[1]);
+      const action = conversationMatch[2];
+      if (request.method === "GET" && !action) {
+        const result = conversations.getSessionWithMessages({ sessionId });
+        if (!result.conversation) return json(response, 404, { error: "conversation not found" });
+        return json(response, 200, result);
+      }
+      if (request.method === "GET" && action === "messages") {
+        const result = conversations.getSessionWithMessages({ sessionId, limit: Number(url.searchParams.get("limit") || 200) });
+        if (!result.conversation) return json(response, 404, { error: "conversation not found" });
+        return json(response, 200, result);
+      }
+      if (request.method === "POST" && action === "archive") {
+        const conversation = conversations.archiveSession(sessionId);
+        if (!conversation) return json(response, 404, { error: "conversation not found" });
+        return json(response, 200, { conversation });
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/collected") {
+      const items = sqlite.listCollectedItems({
+        projectId: url.searchParams.get("projectId") || config.defaultProjectId,
+        userId: url.searchParams.get("userId") || undefined,
+        limit: Number(url.searchParams.get("limit") || 30),
+        offset: Number(url.searchParams.get("offset") || 0)
+      });
+      return json(response, 200, { items });
+    }
+
+    const collectedMatch = url.pathname.match(/^\/api\/collected\/([^/]+)$/);
+    if (request.method === "GET" && collectedMatch) {
+      const item = sqlite.getCollectedItem(decodeURIComponent(collectedMatch[1]));
+      if (!item) return json(response, 404, { error: "collected item not found" });
+      return json(response, 200, { item });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/collected") {
+      const body = await readJsonBody<{ title?: string; content?: string; source?: string; kind?: string; projectId?: string; userId?: string; sessionId?: string; metadata?: Record<string, unknown> }>(request);
+      if (!body.content?.trim()) return json(response, 400, { error: "content is required" });
+      const result = await collectedWorkflow.ingest({
+        userId: body.userId,
+        sessionId: body.sessionId,
+        projectId: body.projectId || config.defaultProjectId,
+        kind: body.kind === "url" || body.kind === "note" || body.kind === "transcript" || body.kind === "wechat_article" || body.kind === "manual_text" ? body.kind : "manual_text",
+        title: body.title?.trim() || "未命名资料",
+        source: body.source,
+        content: body.content,
+        metadata: body.metadata
+      });
+      return json(response, result.status === "failed" ? 500 : 200, result);
     }
 
     if (request.method === "POST" && url.pathname === "/api/chat") {

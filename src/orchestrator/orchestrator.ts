@@ -4,6 +4,8 @@ import { SqliteStore } from "../storage/sqliteStore.js";
 import type {
   ChatResponse,
   ChatStreamCallbacks,
+  ConversationContextPack,
+  ConversationSession,
   DocumentWriteProgressEvent,
   ExecutionResult,
   EvidenceItem,
@@ -27,6 +29,9 @@ import { SkillExecutor } from "./skillExecutor.js";
 import { observeSkillResults } from "./skillObserver.js";
 import { capabilities } from "./registry.js";
 import { MemoryService } from "../services/memoryService.js";
+import { ConversationService } from "../services/conversationService.js";
+import { ContextCompressor } from "../services/contextCompressor.js";
+import { CollectedContentWorkflow } from "../services/collectedContentWorkflow.js";
 import { ParallelRetriever } from "./parallelRetriever.js";
 import { DocumentResolver } from "./documentResolver.js";
 
@@ -37,6 +42,9 @@ export class Orchestrator {
   private readonly skillExecutor: SkillExecutor;
   private readonly parallelRetriever: ParallelRetriever;
   private readonly documentResolver: DocumentResolver;
+  private readonly conversationService: ConversationService;
+  private readonly contextCompressor: ContextCompressor;
+  private readonly collectedContentWorkflow: CollectedContentWorkflow;
 
   constructor(
     private readonly config: AppConfig,
@@ -50,11 +58,16 @@ export class Orchestrator {
     this.skillExecutor = new SkillExecutor(documents);
     this.parallelRetriever = new ParallelRetriever(memory, documents);
     this.documentResolver = new DocumentResolver(sqlite);
+    this.conversationService = new ConversationService(sqlite);
+    this.contextCompressor = new ContextCompressor(ai, config, sqlite, this.conversationService);
+    this.collectedContentWorkflow = new CollectedContentWorkflow(sqlite, documents, memory);
   }
 
   async chat(input: { message: string; sessionId?: string; userId?: string; projectId?: string }): Promise<ChatResponse> {
     const context = createRequestContext(input, this.config.defaultProjectId);
-    this.insertUserMessage(context);
+    const conversation = this.conversationService.ensureConversationSession({ sessionId: input.sessionId, userId: input.userId, projectId: context.projectId, firstMessage: input.message });
+    context.sessionId = conversation.id;
+    this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
 
     const sessionState = this.sqlite.getSessionState(context.sessionId);
     const routePlan = await this.router.route(context);
@@ -65,8 +78,8 @@ export class Orchestrator {
     routePlan.documentResolution = documentResolution;
     if (documentResolution.status === "ambiguous") {
       const answer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
-      this.insertAssistantMessage(context.sessionId, answer);
-      return { answer, routePlan, memoryHits };
+      this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer });
+      return { answer, routePlan, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation };
     }
     const skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities, documentResolution, memoryHits);
     routePlan.skillPlan = skillPlan;
@@ -77,10 +90,12 @@ export class Orchestrator {
     let { skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan);
     evidencePack = evidencePack ? await this.documents.expandEvidencePack({ ...evidencePack, memoryHits, retrievalSources: [...(evidencePack.retrievalSources ?? []), "memory_items"] }) : undefined;
     const guardAnswer = guardedNoEvidenceAnswer(skillPlan, observation);
-    const answer = guardAnswer ?? (await this.generateAnswer(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits));
+    const generation = guardAnswer ? undefined : await this.generateAnswer(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
+    const answer = guardAnswer ?? generation?.answer ?? "";
+    const conversationContext = generation?.conversationContext;
 
-    this.insertAssistantMessage(context.sessionId, answer);
-    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits };
+    this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer, contentType: executionResult ? "workflow_result" : "markdown" });
+    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation, conversationContext };
   }
 
   async chatStream(
@@ -88,7 +103,9 @@ export class Orchestrator {
     callbacks: ChatStreamCallbacks
   ): Promise<ChatResponse> {
     const context = createRequestContext(input, this.config.defaultProjectId);
-    this.insertUserMessage(context);
+    const conversation = this.conversationService.ensureConversationSession({ sessionId: input.sessionId, userId: input.userId, projectId: context.projectId, firstMessage: input.message });
+    context.sessionId = conversation.id;
+    this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
 
     const runId = randomUUID();
     this.sqlite.createRun({
@@ -111,8 +128,10 @@ export class Orchestrator {
     let finalAnswer = "";
     let memoryHits: MemoryHit[] = [];
     let completedWithFallback = false;
+    let conversationContext: ConversationContextPack | undefined;
 
     try {
+      callbacks.onEvent({ type: "conversation_created", runId, visibleMessage: "对话会话已就绪。", conversation });
       await tracker.runStarted("已收到问题，正在判断处理方式。");
       await tracker.stepCompleted("intake", "问题已进入 Orchestrator。", {
         requestId: context.requestId,
@@ -135,8 +154,10 @@ export class Orchestrator {
         callbacks.onEvent({ type: "document_ambiguous", runId, visibleMessage: "找到多篇候选文档，需要选择。", documentResolution });
         finalAnswer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
         await tracker.answerDelta(finalAnswer);
-        this.insertAssistantMessage(context.sessionId, finalAnswer);
-        const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits };
+        this.conversationService.appendMessage({ sessionId: context.sessionId, runId, role: "assistant", content: finalAnswer });
+        const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
+        callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
+        const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext };
         await tracker.done(result, "completed");
         return result;
       }
@@ -161,7 +182,10 @@ export class Orchestrator {
       } else {
         await tracker.observation(observation, "证据足够，开始生成回答。");
         await tracker.stepStarted("context", "正在整理证据和上下文。");
-        const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
+        callbacks.onEvent({ type: "context_compression_started", runId, visibleMessage: "正在压缩历史对话上下文。", sessionId: context.sessionId });
+        const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
+        conversationContext = generationInput.conversationContext;
+        if (conversationContext) callbacks.onEvent({ type: "context_compression_completed", runId, visibleMessage: "对话上下文已整理。", conversationContext });
         await tracker.stepCompleted("context", "上下文已整理完成。", {
           hasEvidence: Boolean(evidencePack),
           evidenceCount: evidencePack?.items.length ?? 0,
@@ -197,8 +221,10 @@ export class Orchestrator {
         }
       }
 
-      this.insertAssistantMessage(context.sessionId, finalAnswer);
-      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits };
+      this.conversationService.appendMessage({ sessionId: context.sessionId, runId, role: "assistant", content: finalAnswer, contentType: executionResult ? "workflow_result" : "markdown" });
+      const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
+      callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
+      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext };
       await tracker.done(result, completedWithFallback ? "completed_with_fallback" : "completed");
       return result;
     } catch (error) {
@@ -222,14 +248,6 @@ export class Orchestrator {
       message: "文档已写入 SQLite、LanceDB，并创建 document_anchor memory。",
       output: { documentId: result.document.id, title: result.document.title, chunkCount: result.chunkCount }
     };
-  }
-
-  private insertUserMessage(context: RequestContext): void {
-    this.sqlite.insertMessage({ id: randomUUID(), sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
-  }
-
-  private insertAssistantMessage(sessionId: string, answer: string): void {
-    this.sqlite.insertMessage({ id: randomUUID(), sessionId, role: "assistant", content: answer, createdAt: new Date().toISOString() });
   }
 
   private async executeSkillsIfNeeded(
@@ -270,33 +288,43 @@ export class Orchestrator {
       return result;
     }
 
-    if (!routePlan.candidateCapabilities.includes("workflow.ingest_text_database")) {
+    if (!routePlan.candidateCapabilities.includes("workflow.ingest_collected_content") && !routePlan.candidateCapabilities.includes("workflow.ingest_text_database")) {
       return { status: "skipped", message: "没有匹配到可执行的 Workflow。" };
     }
 
-    await tracker?.stepStarted("execution", "正在整理并写入知识库。", { capabilityId: "workflow.ingest_text_database" });
+    await tracker?.stepStarted("execution", "正在整理采集内容并写入知识库。", { capabilityId: "workflow.ingest_collected_content" });
     const parsed = extractWritePayload(context.message);
     const content = stringParam(routePlan.extractedParams.content) || parsed?.content;
     if (!content) {
-      const result: ExecutionResult = { status: "failed", capabilityId: "workflow.ingest_text_database", message: "写入数据库缺少 content 参数。", error: "missing content" };
+      const result: ExecutionResult = { status: "failed", capabilityId: "workflow.ingest_collected_content", message: "采集信息入库缺少 content 参数。", error: "missing content" };
       await tracker?.stepFailed("execution", "写入知识库失败，缺少可写入内容。", result.error, { result });
       return result;
     }
 
-    const result = await this.writeDocumentWithProgress(
-      {
-        title: stringParam(routePlan.extractedParams.title) || parsed?.title || "未命名资料",
-        source: stringParam(routePlan.extractedParams.source) || parsed?.source,
-        projectId: context.projectId,
-        content,
-        metadata: { requestId: context.requestId, sessionId: context.sessionId }
-      },
-      context.sessionId,
-      tracker,
-      "workflow.ingest_text_database",
-      userId
-    );
-    await tracker?.stepCompleted("execution", "资料已写入知识库。", { result });
+    const result = await this.collectedContentWorkflow.ingest({
+      userId,
+      sessionId: context.sessionId,
+      projectId: context.projectId,
+      kind: (stringParam(routePlan.extractedParams.kind) as "manual_text") || "manual_text",
+      title: stringParam(routePlan.extractedParams.title) || parsed?.title || "未命名资料",
+      source: stringParam(routePlan.extractedParams.source) || parsed?.source,
+      content,
+      metadata: { requestId: context.requestId, sessionId: context.sessionId, workflow: "workflow.ingest_collected_content" },
+      onProgress: async (event) => {
+        if (event.type === "collected_item_created") {
+          await tracker?.event({ type: "collected_item_created", runId: trackerRunId(tracker), visibleMessage: "采集记录已创建。", collectedItem: event.item });
+          await tracker?.metadata({ progress: event, collectedItem: event.item }, "采集记录已创建。");
+        } else if (event.type === "collected_item_completed") {
+          await tracker?.event({ type: "collected_item_completed", runId: trackerRunId(tracker), visibleMessage: "采集内容注册完成。", collectedItem: event.item });
+          await tracker?.metadata({ progress: event, collectedItem: event.item }, "采集内容注册完成。");
+        } else if (event.type === "collected_item_failed") {
+          await tracker?.metadata({ progress: event, collectedItem: event.item }, "采集内容注册失败。");
+        } else {
+          await tracker?.metadata({ progress: event }, documentProgressMessage(event as DocumentWriteProgressEvent));
+        }
+      }
+    });
+    await tracker?.stepCompleted("execution", "采集资料已写入知识库。", { result });
     return result;
   }
 
@@ -304,33 +332,38 @@ export class Orchestrator {
     try {
       const article = await this.wechatArticles.fetchArticle(url);
       await tracker?.metadata({ progress: { type: "wechat_article_fetched", url, title: article.title } }, "文章内容已获取，正在写入知识库。");
-      const result = await this.writeDocumentWithProgress(
-        {
-          title: article.title,
-          source: article.url,
-          projectId: context.projectId,
-          content: article.content,
-          metadata: {
-            requestId: context.requestId,
-            sessionId: context.sessionId,
-            workflow: "workflow.ingest_wechat_article",
-            author: article.author,
-            publishTime: article.publishTime,
-            markdownFile: article.markdownFile,
-            infoFile: article.infoFile,
-            wespyInfo: article.rawInfo
-          }
+      const result = await this.collectedContentWorkflow.ingest({
+        userId,
+        sessionId: context.sessionId,
+        projectId: context.projectId,
+        kind: "wechat_article",
+        title: article.title,
+        source: article.url,
+        content: article.content,
+        metadata: {
+          requestId: context.requestId,
+          sessionId: context.sessionId,
+          workflow: "workflow.ingest_wechat_article",
+          author: article.author,
+          publishTime: article.publishTime,
+          markdownFile: article.markdownFile,
+          infoFile: article.infoFile,
+          wespyInfo: article.rawInfo
         },
-        context.sessionId,
-        tracker,
-        "workflow.ingest_wechat_article",
-        userId
-      );
-
+        onProgress: async (event) => {
+          if (event.type === "collected_item_created" || event.type === "collected_item_completed" || event.type === "collected_item_failed") {
+            if (event.type === "collected_item_created") await tracker?.event({ type: "collected_item_created", runId: trackerRunId(tracker), visibleMessage: "采集记录已创建。", collectedItem: event.item });
+            if (event.type === "collected_item_completed") await tracker?.event({ type: "collected_item_completed", runId: trackerRunId(tracker), visibleMessage: "采集内容注册完成。", collectedItem: event.item });
+            await tracker?.metadata({ progress: event, collectedItem: event.item }, event.type === "collected_item_created" ? "采集记录已创建。" : "采集内容注册完成。");
+          } else {
+            await tracker?.metadata({ progress: event }, documentProgressMessage(event as DocumentWriteProgressEvent));
+          }
+        }
+      });
       return {
         ...result,
         capabilityId: "workflow.ingest_wechat_article",
-        message: "公众号文章已通过 WeSpy 获取，并写入 SQLite 与 LanceDB。",
+        message: "公众号文章已通过 WeSpy 获取，并复用采集内容链路写入 SQLite 与 LanceDB。",
         output: { ...result.output, source: article.url, author: article.author, publishTime: article.publishTime }
       };
     } catch (error) {
@@ -346,7 +379,7 @@ export class Orchestrator {
     userId?: string
   ): Promise<ExecutionResult> {
     const result = await this.documents.writeDocument(input, async (event) => {
-      await tracker?.metadata({ progress: event }, documentProgressMessage(event));
+      await tracker?.metadata({ progress: event }, documentProgressMessage(event as DocumentWriteProgressEvent));
     });
     this.sqlite.upsertSessionState({
       sessionId,
@@ -380,15 +413,18 @@ export class Orchestrator {
     skillResults?: SkillExecutionResult[],
     observation?: SkillObservation,
     memoryHits: MemoryHit[] = []
-  ): Promise<string> {
-    const generationInput = this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
+  ): Promise<{ answer: string; conversationContext?: ConversationContextPack }> {
+    const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
     if (generationInput.kind === "static") {
-      return generationInput.answer;
+      return { answer: generationInput.answer, conversationContext: generationInput.conversationContext };
     }
-    return this.ai.chat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.history, generationInput.prompt) });
+    return {
+      answer: await this.ai.chat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.prompt) }),
+      conversationContext: generationInput.conversationContext
+    };
   }
 
-  private prepareGenerationInput(
+  private async prepareGenerationInput(
     context: RequestContext,
     routePlan: RoutePlan,
     executionResult?: ExecutionResult,
@@ -397,19 +433,20 @@ export class Orchestrator {
     skillResults?: SkillExecutionResult[],
     observation?: SkillObservation,
     memoryHits: MemoryHit[] = []
-  ): GenerationInput {
-    if (executionResult?.capabilityId === "workflow.ingest_text_database" || executionResult?.capabilityId === "workflow.ingest_wechat_article") {
-      return { kind: "static", answer: this.renderWorkflowAnswer(executionResult) };
+  ): Promise<GenerationInput> {
+    const conversationContext = await this.contextCompressor.buildContextPack({ sessionId: context.sessionId, projectId: context.projectId, userId: context.userId });
+    if (executionResult?.capabilityId === "workflow.ingest_text_database" || executionResult?.capabilityId === "workflow.ingest_wechat_article" || executionResult?.capabilityId === "workflow.ingest_collected_content") {
+      return { kind: "static", answer: this.renderWorkflowAnswer(executionResult), conversationContext };
     }
 
     if (!this.ai.canChat(this.config.ai.chatModel)) {
       return {
         kind: "static",
-        answer: evidencePack ? renderEvidenceFallback(evidencePack.items) : "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。"
+        answer: evidencePack ? renderEvidenceFallback(evidencePack.items) : "云端生成模型未配置。请在 .env 中设置 AI_API_KEY 和 AI_CHAT_MODEL。",
+        conversationContext
       };
     }
 
-    const history = this.sqlite.listSessionMessages(context.sessionId, 8);
     const answerStrategy = skillPlan?.answerStrategy ?? routePlan.answerStrategy ?? "direct";
     const prompt = buildFinalPrompt({
       request: context,
@@ -421,9 +458,10 @@ export class Orchestrator {
       observation,
       answerStrategy,
       constraints: defaultConstraints(answerStrategy),
-      memoryHits
+      memoryHits,
+      conversationContext
     });
-    return { kind: "model", history, prompt };
+    return { kind: "model", prompt, conversationContext };
   }
 
   private async *generateAnswerStreamFromPrepared(generationInput: GenerationInput): AsyncGenerator<string> {
@@ -431,7 +469,7 @@ export class Orchestrator {
       yield generationInput.answer;
       return;
     }
-    for await (const chunk of this.ai.streamChat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.history, generationInput.prompt) })) {
+    for await (const chunk of this.ai.streamChat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.prompt) })) {
       yield chunk;
     }
   }
@@ -446,8 +484,8 @@ export class Orchestrator {
 }
 
 type GenerationInput =
-  | { kind: "static"; answer: string }
-  | { kind: "model"; history: Array<{ role: "user" | "assistant"; content: string }>; prompt: string };
+  | { kind: "static"; answer: string; conversationContext?: ConversationContextPack }
+  | { kind: "model"; prompt: string; conversationContext?: ConversationContextPack };
 
 
 export function isTimeoutError(error: unknown): boolean {
@@ -478,10 +516,9 @@ function renderGenerationFallback(error: unknown, evidencePack?: EvidencePack): 
   return [`最终生成模型超时${detail}。已先返回本次检索到的资料摘要：`, ...items].join("\n\n");
 }
 
-function buildFinalMessages(history: Array<{ role: "user" | "assistant"; content: string }>, prompt: string) {
+function buildFinalMessages(prompt: string) {
   return [
     { role: "system" as const, content: "你是 AI Orchestrator 的最终生成模型。你不重新决定系统路径，只基于给定任务包回答。" },
-    ...history,
     { role: "user" as const, content: prompt }
   ];
 }
@@ -539,6 +576,10 @@ function mergeEvidencePacks(skillResults: SkillExecutionResult[]): EvidencePack 
 function renderAmbiguousDocumentAnswer(candidates: Array<{ documentId: string; title: string; source?: string; reason: string }>): string {
   const lines = candidates.slice(0, 5).map((candidate, index) => `${index + 1}. 《${candidate.title}》 documentId=${candidate.documentId}${candidate.source ? ` source=${candidate.source}` : ""} (${candidate.reason})`);
   return [`找到多篇候选文档，需要你指定要分析哪一篇：`, ...lines].join("\n");
+}
+
+function trackerRunId(tracker?: RunTracker): string {
+  return String((tracker as unknown as { runId?: string })?.runId ?? "");
 }
 
 function documentProgressMessage(event: DocumentWriteProgressEvent): string {

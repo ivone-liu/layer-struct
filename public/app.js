@@ -3,119 +3,171 @@ const input = document.querySelector("#message-input");
 const messages = document.querySelector("#messages");
 const details = document.querySelector("#details");
 const status = document.querySelector("#status");
+const conversationList = document.querySelector("#conversation-list");
+const newConversationButton = document.querySelector("#new-conversation");
+const currentTitle = document.querySelector("#current-title");
 
-const sessionId = crypto.randomUUID();
+let currentSessionId;
+let conversations = [];
 
-void refreshHealth();
+void init();
+
+newConversationButton.addEventListener("click", async () => {
+  const response = await fetch("/api/conversations", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
+  const payload = await response.json();
+  currentSessionId = payload.conversation.id;
+  messages.innerHTML = "";
+  conversations = [payload.conversation, ...conversations.filter((item) => item.id !== payload.conversation.id)];
+  renderConversationList();
+  renderCurrentTitle(payload.conversation);
+});
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const message = input.value.trim();
-  if (!message) {
-    return;
-  }
+  if (!message) return;
 
   input.value = "";
+  removeWelcome();
   appendMessage("user", message);
   const assistantMessage = appendAssistantMessage();
   setBusy(true);
-
   let sseErrorReceived = false;
 
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message, sessionId })
+      body: JSON.stringify({ message, sessionId: currentSessionId })
     });
-
     if (!response.ok || !response.body) {
       const payload = await response.json();
       throw new Error(payload.error || "请求失败");
     }
 
     for await (const event of readSse(response.body)) {
+      if (event.conversation) {
+        currentSessionId = event.conversation.id;
+        upsertConversation(event.conversation);
+      }
       if (event.type === "run_started") {
         addProgressItem(assistantMessage.progress, "intake", event.visibleMessage, "running");
-        status.textContent = "处理中";
-        status.className = "status warn";
+        setStatus("处理中", "warn");
       }
-
-      if (event.type === "step_started") {
-        updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage, "running");
+      if (event.type === "conversation_created" || event.type === "conversation_updated") {
+        addProgressItem(assistantMessage.progress, event.type, event.visibleMessage, "done");
       }
-
-      if (event.type === "step_completed") {
-        updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage, "done");
-      }
-
-      if (event.type === "step_failed") {
-        updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage || event.error, "failed");
-      }
-
+      if (event.type === "context_compression_started") updateProgressItem(assistantMessage.progress, "context-compression", event.visibleMessage, "running");
+      if (event.type === "context_compression_completed") updateProgressItem(assistantMessage.progress, "context-compression", event.visibleMessage, "done");
+      if (event.type === "step_started") updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage, "running");
+      if (event.type === "step_completed") updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage, "done");
+      if (event.type === "step_failed") updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage || event.error, "failed");
       if (["skill_plan", "skill_started", "skill_completed", "skill_failed", "observation"].includes(event.type)) {
         const state = event.type === "skill_failed" ? "failed" : event.type === "skill_started" ? "running" : "done";
         addProgressItem(assistantMessage.progress, progressEventKey(event), event.visibleMessage || event.type, state);
         renderDetails(event);
       }
-
       if (event.type === "metadata") {
-        if (event.visibleMessage) {
-          addProgressItem(assistantMessage.progress, metadataProgressKey(event), event.visibleMessage, "done");
-        }
-        if (event.routePlan || event.payload?.routePlan) {
-          renderDetails(event);
-        }
+        if (event.visibleMessage) addProgressItem(assistantMessage.progress, metadataProgressKey(event), event.visibleMessage, "done");
+        renderDetails(event);
       }
-
       if (event.type === "assistant_delta") {
         appendMarkdownDelta(assistantMessage.answer, event.content);
         messages.scrollTop = messages.scrollHeight;
       }
-
       if (event.type === "done") {
         renderDetails(event);
-        status.textContent = event.status === "completed_with_fallback" ? "已降级" : "已完成";
-        status.className = event.status === "completed_with_fallback" ? "status warn" : "status ok";
+        setStatus(event.status === "completed_with_fallback" ? "已降级" : "已完成", event.status === "completed_with_fallback" ? "warn" : "ok");
       }
-
       if (event.type === "error") {
         sseErrorReceived = true;
         const friendlyMessage = event.friendlyMessage || event.error || "生成模型响应超时，请稍后重试或缩短问题。";
         addProgressItem(assistantMessage.progress, "error", friendlyMessage, "failed");
-        if (!assistantMessage.answer.dataset.markdown) {
-          renderMarkdownInto(assistantMessage.answer, friendlyMessage);
-        }
-        status.textContent = event.recoverable ? "已降级" : "失败";
-        status.className = event.recoverable ? "status warn" : "status error";
+        if (!assistantMessage.answer.dataset.markdown) renderMarkdownInto(assistantMessage.answer, friendlyMessage);
+        setStatus(event.recoverable ? "已降级" : "失败", event.recoverable ? "warn" : "error");
         break;
       }
     }
   } catch (error) {
-    if (!sseErrorReceived && !assistantMessage.answer.dataset.markdown) {
-      renderMarkdownInto(assistantMessage.answer, error instanceof Error ? error.message : "网络请求失败，请稍后重试。");
-    }
-    if (!sseErrorReceived) {
-      status.textContent = "失败";
-      status.className = "status error";
-    }
+    if (!sseErrorReceived && !assistantMessage.answer.dataset.markdown) renderMarkdownInto(assistantMessage.answer, error instanceof Error ? error.message : "网络请求失败，请稍后重试。");
+    if (!sseErrorReceived) setStatus("失败", "error");
   } finally {
     setBusy(false);
     void refreshHealth();
   }
 });
 
+async function init() {
+  await refreshHealth();
+  await refreshConversations();
+  if (conversations[0]) await openConversation(conversations[0].id);
+}
+
+async function refreshConversations() {
+  const response = await fetch("/api/conversations?limit=30");
+  const payload = await response.json();
+  conversations = payload.conversations || [];
+  renderConversationList();
+}
+
+async function openConversation(sessionId) {
+  const response = await fetch(`/api/conversations/${encodeURIComponent(sessionId)}/messages`);
+  const payload = await response.json();
+  currentSessionId = sessionId;
+  messages.innerHTML = "";
+  for (const message of payload.messages || []) appendMessage(message.role, message.content, { renderMarkdown: message.role === "assistant" });
+  if (!payload.messages?.length) appendWelcome();
+  renderCurrentTitle(payload.conversation);
+  upsertConversation(payload.conversation);
+}
+
+function renderConversationList() {
+  conversationList.innerHTML = "";
+  for (const conversation of conversations) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `conversation-item${conversation.id === currentSessionId ? " active" : ""}`;
+    button.innerHTML = `<span class="conversation-title"></span><span class="conversation-preview"></span><time></time>`;
+    button.querySelector(".conversation-title").textContent = conversation.title || "新对话";
+    button.querySelector(".conversation-preview").textContent = conversation.lastMessagePreview || "暂无消息";
+    button.querySelector("time").textContent = formatTime(conversation.lastMessageAt || conversation.updatedAt);
+    button.addEventListener("click", () => void openConversation(conversation.id));
+    conversationList.appendChild(button);
+  }
+}
+
+function upsertConversation(conversation) {
+  conversations = [conversation, ...conversations.filter((item) => item.id !== conversation.id)];
+  renderCurrentTitle(conversation);
+  renderConversationList();
+}
+
+function renderCurrentTitle(conversation) {
+  currentTitle.textContent = conversation?.title || "个人采集与对话中心";
+}
+
+function appendWelcome() {
+  messages.innerHTML = `<article class="message assistant welcome-message"><div class="bubble">这是一个空对话，直接输入即可开始。</div></article>`;
+}
+
+function removeWelcome() {
+  messages.querySelector(".welcome-message")?.remove();
+}
+
 async function refreshHealth() {
   try {
     const response = await fetch("/api/health");
     const payload = await response.json();
     const configured = payload.ai?.embeddingConfigured && payload.ai?.chatConfigured;
-    status.textContent = configured ? "已配置" : "待配置";
-    status.className = `status ${configured ? "ok" : "warn"}`;
+    setStatus(configured ? "已配置" : "待配置", configured ? "ok" : "warn");
   } catch {
-    status.textContent = "离线";
-    status.className = "status warn";
+    setStatus("离线", "warn");
   }
+}
+
+function setStatus(text, kind) {
+  status.textContent = text;
+  status.className = `status ${kind}`;
 }
 
 async function* readSse(stream) {
@@ -506,4 +558,11 @@ function renderDetails(payload) {
 function setBusy(busy) {
   form.querySelector("button").disabled = busy;
   input.disabled = busy;
+}
+
+function formatTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }

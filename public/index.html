@@ -3,35 +3,38 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Orchestrator</title>
+    <title>个人采集与对话中心</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="app">
-      <section class="chat-shell" aria-label="AI Orchestrator 对话">
+      <aside class="conversation-panel" aria-label="对话列表">
+        <div class="conversation-header">
+          <h2>对话</h2>
+          <button id="new-conversation" type="button">新建对话</button>
+        </div>
+        <div id="conversation-list" class="conversation-list"></div>
+      </aside>
+
+      <section class="chat-shell" aria-label="个人采集与对话中心">
         <header class="topbar">
           <div>
-            <h1>AI Orchestrator</h1>
-            <p>Router + RAG + SQLite + LanceDB</p>
+            <h1 id="current-title">个人采集与对话中心</h1>
+            <p>对话记录 + 采集信息 + RAG + Memory + 上下文压缩</p>
           </div>
           <span id="status" class="status">检查中</span>
         </header>
 
         <div id="messages" class="messages">
-          <article class="message assistant">
+          <article class="message assistant welcome-message">
             <div class="bubble">
-              可以直接对话，也可以说“写入数据库：...”或“查询数据库：...”。我会把真实执行过程显示在回答上方，并把路由、召回和执行结果放在右侧详情里。
+              选择左侧历史对话继续，或新建对话。你也可以说“保存这段：标题：...”，我会把资料写入知识库并创建记忆锚点。
             </div>
           </article>
         </div>
 
         <form id="chat-form" class="composer">
-          <textarea
-            id="message-input"
-            name="message"
-            rows="3"
-            placeholder="输入：写入数据库：标题：架构原则&#10;Orchestrator 是代码主导、模型辅助的调度系统。"
-          ></textarea>
+          <textarea id="message-input" name="message" rows="3" placeholder="输入：保存这段：标题：AI范式变化&#10;这里是一段内容……"></textarea>
           <button type="submit">发送</button>
         </form>
       </section>
