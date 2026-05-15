@@ -2,6 +2,9 @@ export type TaskType = "chat" | "rag_chat" | "skill_call" | "workflow";
 export type CapabilityKind = "skill" | "workflow";
 export type RiskLevel = "low" | "medium" | "high";
 export type CostLevel = "low" | "medium" | "high";
+export type RunStatus = "running" | "completed" | "failed";
+export type RunStepName = "intake" | "router" | "execution" | "retrieval" | "context" | "generation";
+export type RunStepStatus = "running" | "completed" | "failed";
 
 export interface RequestContext {
   requestId: string;
@@ -89,12 +92,60 @@ export interface ChatResponse {
   executionResult?: ExecutionResult;
 }
 
+export type DocumentWriteProgressEvent =
+  | { type: "document_created"; documentId: string; title: string; chunkCount: number }
+  | { type: "chunks_created"; documentId: string; chunkCount: number }
+  | { type: "embedding_started"; documentId: string; chunkCount: number }
+  | { type: "embedding_progress"; documentId: string; completed: number; total: number }
+  | { type: "vectors_written"; documentId: string; vectorCount: number };
+
 export type ChatStreamEvent =
-  | { type: "assistant_delta"; content: string }
-  | { type: "status"; message: string }
-  | { type: "metadata"; routePlan: RoutePlan; evidencePack?: EvidencePack; executionResult?: ExecutionResult }
-  | { type: "done"; answer: string; routePlan: RoutePlan; evidencePack?: EvidencePack; executionResult?: ExecutionResult }
-  | { type: "error"; error: string };
+  | { type: "run_started"; runId: string; status: RunStatus; visibleMessage: string; createdAt: string }
+  | {
+      type: "step_started";
+      runId: string;
+      step: RunStepName;
+      status: RunStepStatus;
+      visibleMessage: string;
+      debug?: Record<string, unknown>;
+    }
+  | {
+      type: "step_completed";
+      runId: string;
+      step: RunStepName;
+      status: RunStepStatus;
+      visibleMessage: string;
+      debug?: Record<string, unknown>;
+    }
+  | {
+      type: "step_failed";
+      runId: string;
+      step: RunStepName;
+      status: RunStepStatus;
+      visibleMessage: string;
+      error: string;
+      debug?: Record<string, unknown>;
+    }
+  | { type: "assistant_delta"; runId: string; content: string }
+  | {
+      type: "metadata";
+      runId: string;
+      visibleMessage?: string;
+      payload?: Record<string, unknown>;
+      routePlan?: RoutePlan;
+      evidencePack?: EvidencePack;
+      executionResult?: ExecutionResult;
+    }
+  | {
+      type: "done";
+      runId: string;
+      status: RunStatus;
+      answer: string;
+      routePlan: RoutePlan;
+      evidencePack?: EvidencePack;
+      executionResult?: ExecutionResult;
+    }
+  | { type: "error"; runId?: string; status?: RunStatus; error: string };
 
 export interface ChatStreamCallbacks {
   onEvent: (event: ChatStreamEvent) => void | Promise<void>;

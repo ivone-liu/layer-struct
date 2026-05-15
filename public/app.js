@@ -17,7 +17,7 @@ form.addEventListener("submit", async (event) => {
 
   input.value = "";
   appendMessage("user", message);
-  const assistantBubble = appendMessage("assistant", "", { renderMarkdown: true });
+  const assistantMessage = appendAssistantMessage();
   setBusy(true);
 
   try {
@@ -33,27 +33,52 @@ form.addEventListener("submit", async (event) => {
     }
 
     for await (const event of readSse(response.body)) {
-      if (event.type === "assistant_delta") {
-        appendMarkdownDelta(assistantBubble, event.content);
-        messages.scrollTop = messages.scrollHeight;
-      }
-
-      if (event.type === "status") {
-        status.textContent = event.message;
+      if (event.type === "run_started") {
+        addProgressItem(assistantMessage.progress, "intake", event.visibleMessage, "running");
+        status.textContent = "处理中";
         status.className = "status warn";
       }
 
-      if (event.type === "metadata" || event.type === "done") {
+      if (event.type === "step_started") {
+        updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage, "running");
+      }
+
+      if (event.type === "step_completed") {
+        updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage, "done");
+      }
+
+      if (event.type === "step_failed") {
+        updateProgressItem(assistantMessage.progress, event.step, event.visibleMessage || event.error, "failed");
+      }
+
+      if (event.type === "metadata") {
+        if (event.visibleMessage) {
+          addProgressItem(assistantMessage.progress, metadataProgressKey(event), event.visibleMessage, "done");
+        }
+        if (event.routePlan || event.payload?.routePlan) {
+          renderDetails(event);
+        }
+      }
+
+      if (event.type === "assistant_delta") {
+        appendMarkdownDelta(assistantMessage.answer, event.content);
+        messages.scrollTop = messages.scrollHeight;
+      }
+
+      if (event.type === "done") {
         renderDetails(event);
+        status.textContent = "已完成";
+        status.className = "status ok";
       }
 
       if (event.type === "error") {
+        addProgressItem(assistantMessage.progress, "error", event.error || "流式响应失败", "failed");
         throw new Error(event.error || "流式响应失败");
       }
     }
   } catch (error) {
-    if (!assistantBubble.dataset.markdown) {
-      assistantBubble.textContent = error instanceof Error ? error.message : "未知错误";
+    if (!assistantMessage.answer.dataset.markdown) {
+      renderMarkdownInto(assistantMessage.answer, error instanceof Error ? error.message : "未知错误");
     }
   } finally {
     setBusy(false);
@@ -135,6 +160,69 @@ function appendMessage(role, content, options = {}) {
   messages.appendChild(article);
   messages.scrollTop = messages.scrollHeight;
   return bubble;
+}
+
+function appendAssistantMessage() {
+  const article = document.createElement("article");
+  article.className = "message assistant";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble assistant-composite";
+
+  const progress = document.createElement("div");
+  progress.className = "run-progress";
+  progress.setAttribute("aria-label", "执行过程");
+
+  const answer = document.createElement("div");
+  answer.className = "answer markdown-body";
+
+  bubble.append(progress, answer);
+  article.appendChild(bubble);
+  messages.appendChild(article);
+  messages.scrollTop = messages.scrollHeight;
+  return { article, progress, answer };
+}
+
+function updateProgressItem(container, key, message, state) {
+  const existing = container.querySelector(`[data-progress-key="${cssEscape(key)}"]`);
+  if (existing) {
+    existing.querySelector(".progress-text").textContent = message;
+    existing.dataset.state = state;
+    return existing;
+  }
+  return addProgressItem(container, key, message, state);
+}
+
+function addProgressItem(container, key, message, state) {
+  const item = document.createElement("div");
+  item.className = "progress-item";
+  item.dataset.progressKey = key;
+  item.dataset.state = state;
+
+  const dot = document.createElement("span");
+  dot.className = "progress-dot";
+  dot.setAttribute("aria-hidden", "true");
+
+  const text = document.createElement("span");
+  text.className = "progress-text";
+  text.textContent = message;
+
+  item.append(dot, text);
+  container.appendChild(item);
+  messages.scrollTop = messages.scrollHeight;
+  return item;
+}
+
+function metadataProgressKey(event) {
+  const progressType = event.payload?.progress?.type;
+  return progressType ? `metadata-${progressType}` : `metadata-${crypto.randomUUID()}`;
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) {
+    return CSS.escape(value);
+  }
+  return String(value).replace(/"/g, "\\\"");
 }
 
 function appendMarkdownDelta(element, delta) {
@@ -373,9 +461,10 @@ function escapeAttribute(value) {
 function renderDetails(payload) {
   details.textContent = JSON.stringify(
     {
-      routePlan: payload.routePlan,
-      executionResult: payload.executionResult,
-      evidencePack: payload.evidencePack
+      runId: payload.runId,
+      routePlan: payload.routePlan ?? payload.payload?.routePlan,
+      executionResult: payload.executionResult ?? payload.payload?.executionResult,
+      evidencePack: payload.evidencePack ?? payload.payload?.evidencePack
     },
     null,
     2
