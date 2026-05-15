@@ -5,6 +5,7 @@ import path from "node:path";
 import { OpenAiCompatibleClient } from "./ai/openAiCompatibleClient.js";
 import { loadConfig } from "./config/env.js";
 import { Orchestrator } from "./orchestrator/orchestrator.js";
+import { formatUserFacingError } from "./orchestrator/runTracker.js";
 import { DocumentService } from "./services/documentService.js";
 import { LanceVectorStore } from "./storage/lanceVectorStore.js";
 import { SqliteStore } from "./storage/sqliteStore.js";
@@ -73,6 +74,7 @@ const server = createServer(async (request, response) => {
         "x-accel-buffering": "no"
       });
 
+      let streamErrorEmitted = false;
       try {
         await orchestrator.chatStream(
           {
@@ -82,14 +84,24 @@ const server = createServer(async (request, response) => {
             userId: body.userId
           },
           {
-            onEvent: (event) => writeSse(response, event)
+            onEvent: (event) => {
+              if (event.type === "error") {
+                streamErrorEmitted = true;
+              }
+              writeSse(response, event);
+            }
           }
         );
       } catch (error) {
-        writeSse(response, {
-          type: "error",
-          error: error instanceof Error ? error.message : "unknown error"
-        });
+        if (!streamErrorEmitted && !response.writableEnded) {
+          const friendlyMessage = formatUserFacingError(error);
+          writeSse(response, {
+            type: "error",
+            error: friendlyMessage,
+            friendlyMessage,
+            debug: { rawError: error instanceof Error ? error.message : String(error) }
+          });
+        }
       } finally {
         response.end();
       }

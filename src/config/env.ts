@@ -23,6 +23,10 @@ export interface AppConfig {
     embeddingModel: string;
     embeddingDim: number;
     requestTimeoutMs: number;
+    streamConnectTimeoutMs: number;
+    streamFirstTokenTimeoutMs: number;
+    streamIdleTimeoutMs: number;
+    streamTotalTimeoutMs: number;
   };
 }
 
@@ -85,7 +89,11 @@ export function loadConfig(): AppConfig {
       chatModel: readString("AI_CHAT_MODEL"),
       embeddingModel: readString("AI_EMBEDDING_MODEL"),
       embeddingDim: readNumber("AI_EMBEDDING_DIM", 1536),
-      requestTimeoutMs: readNumber("AI_REQUEST_TIMEOUT_MS", 30000)
+      requestTimeoutMs: readNumber("AI_REQUEST_TIMEOUT_MS", 60000),
+      streamConnectTimeoutMs: readNumber("AI_STREAM_CONNECT_TIMEOUT_MS", 30000),
+      streamFirstTokenTimeoutMs: readNumber("AI_STREAM_FIRST_TOKEN_TIMEOUT_MS", 60000),
+      streamIdleTimeoutMs: readNumber("AI_STREAM_IDLE_TIMEOUT_MS", 60000),
+      streamTotalTimeoutMs: readNumber("AI_STREAM_TOTAL_TIMEOUT_MS", 180000)
     }
   };
 }

@@ -2,7 +2,7 @@ export type TaskType = "chat" | "rag_chat" | "skill_call" | "workflow";
 export type CapabilityKind = "skill" | "workflow";
 export type RiskLevel = "low" | "medium" | "high";
 export type CostLevel = "low" | "medium" | "high";
-export type RunStatus = "running" | "completed" | "failed";
+export type RunStatus = "running" | "completed" | "completed_with_fallback" | "failed";
 export type RunStepName = "intake" | "router" | "execution" | "retrieval" | "context" | "generation";
 export type RunStepStatus = "running" | "completed" | "failed";
 export type AnswerStrategy = "direct" | "rag" | "citation" | "workflow" | "multi_step";
@@ -211,7 +211,7 @@ export type ChatStreamEvent =
       skillResults?: SkillExecutionResult[];
       observation?: SkillObservation;
     }
-  | { type: "error"; runId?: string; status?: RunStatus; error: string };
+  | { type: "error"; runId?: string; status?: RunStatus; error: string; friendlyMessage?: string; recoverable?: boolean; debug?: Record<string, unknown> };
 
 export interface ChatStreamCallbacks {
   onEvent: (event: ChatStreamEvent) => void | Promise<void>;

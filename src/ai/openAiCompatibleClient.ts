@@ -5,6 +5,16 @@ export interface ChatMessage {
   content: string;
 }
 
+export class AiTimeoutError extends Error {
+  constructor(
+    public readonly phase: "connect" | "first_token" | "idle" | "total" | "request",
+    public readonly timeoutMs: number
+  ) {
+    super(`AI ${phase} timed out after ${timeoutMs}ms`);
+    this.name = "AiTimeoutError";
+  }
+}
+
 export class OpenAiCompatibleClient {
   constructor(private readonly config: AppConfig["ai"]) {}
 
@@ -78,9 +88,44 @@ export class OpenAiCompatibleClient {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    let abortPhase: AiTimeoutError["phase"] | undefined;
+    let abortTimeoutMs = 0;
+    let connectTimeout: NodeJS.Timeout | undefined;
+    let firstTokenTimeout: NodeJS.Timeout | undefined;
+    let idleTimeout: NodeJS.Timeout | undefined;
+    let totalTimeout: NodeJS.Timeout | undefined;
+
+    const abortAfter = (phase: AiTimeoutError["phase"], timeoutMs: number) => {
+      if (timeoutMs <= 0 || controller.signal.aborted) {
+        return undefined;
+      }
+      const timer = setTimeout(() => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        abortPhase = phase;
+        abortTimeoutMs = timeoutMs;
+        controller.abort();
+      }, timeoutMs);
+      timer.unref?.();
+      return timer;
+    };
+
+    const clearTimer = (timer: NodeJS.Timeout | undefined) => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+
+    const resetIdleTimeout = () => {
+      clearTimer(idleTimeout);
+      idleTimeout = abortAfter("idle", this.config.streamIdleTimeoutMs);
+    };
 
     try {
+      connectTimeout = abortAfter("connect", this.config.streamConnectTimeoutMs);
+      totalTimeout = abortAfter("total", this.config.streamTotalTimeoutMs);
+
       const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -95,6 +140,8 @@ export class OpenAiCompatibleClient {
         }),
         signal: controller.signal
       });
+      clearTimer(connectTimeout);
+      connectTimeout = undefined;
 
       if (!response.ok) {
         const detail = await response.text();
@@ -105,9 +152,14 @@ export class OpenAiCompatibleClient {
         throw new Error("AI stream response has no body.");
       }
 
+      firstTokenTimeout = abortAfter("first_token", this.config.streamFirstTokenTimeoutMs);
+      resetIdleTimeout();
+
       const decoder = new TextDecoder();
       let buffer = "";
+      let hasFirstToken = false;
       for await (const chunk of response.body) {
+        resetIdleTimeout();
         buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() ?? "";
@@ -115,6 +167,12 @@ export class OpenAiCompatibleClient {
         for (const line of lines) {
           const content = parseStreamLine(line);
           if (content) {
+            if (!hasFirstToken) {
+              hasFirstToken = true;
+              clearTimer(firstTokenTimeout);
+              firstTokenTimeout = undefined;
+            }
+            resetIdleTimeout();
             yield content;
           }
         }
@@ -124,17 +182,35 @@ export class OpenAiCompatibleClient {
       for (const line of buffer.split(/\r?\n/)) {
         const content = parseStreamLine(line);
         if (content) {
+          if (!hasFirstToken) {
+            hasFirstToken = true;
+            clearTimer(firstTokenTimeout);
+            firstTokenTimeout = undefined;
+          }
+          resetIdleTimeout();
           yield content;
         }
       }
+    } catch (error) {
+      if (error instanceof AiTimeoutError) {
+        throw error;
+      }
+      if (isAbortError(error)) {
+        throw new AiTimeoutError(abortPhase ?? "request", abortTimeoutMs || this.config.requestTimeoutMs);
+      }
+      throw error;
     } finally {
-      clearTimeout(timeout);
+      clearTimer(connectTimeout);
+      clearTimer(firstTokenTimeout);
+      clearTimer(idleTimeout);
+      clearTimer(totalTimeout);
     }
   }
 
   private async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
+    timeout.unref?.();
 
     try {
       const response = await fetch(`${this.config.baseUrl}${path}`, {
@@ -153,10 +229,19 @@ export class OpenAiCompatibleClient {
       }
 
       return (await response.json()) as T;
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw new AiTimeoutError("request", this.config.requestTimeoutMs);
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError" || error instanceof Error && error.name === "AbortError";
 }
 
 function parseStreamLine(line: string): string | undefined {

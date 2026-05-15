@@ -1,50 +1,55 @@
-import type { AnswerStrategy, FinalContext } from "../types.js";
+import type { AnswerStrategy, EvidenceItem, FinalContext, RoutePlan, SkillExecutionResult, SkillPlan } from "../types.js";
 
 export function buildFinalPrompt(context: FinalContext): string {
-  const evidence = context.evidencePack?.items.length
-    ? context.evidencePack.items
-        .map(
-          (item, index) =>
-            `[${index + 1}] chunkId=${item.chunkId} documentId=${item.documentId} chunkIndex=${item.chunkIndex ?? "unknown"} title=${item.title} source=${item.source ?? "local-db"} score=${item.score}\n${item.content}`
-        )
-        .join("\n\n")
-    : "无外部证据。";
-
-  const execution = context.executionResult ? JSON.stringify(context.executionResult, null, 2) : "无能力执行结果。";
-  const skillPlan = context.skillPlan ? JSON.stringify(context.skillPlan, null, 2) : "无 SkillPlan。";
-  const skillResults = context.skillResults ? JSON.stringify(context.skillResults, null, 2) : "无 SkillResults。";
-  const observation = context.observation ? JSON.stringify(context.observation, null, 2) : "无 Observation。";
+  const answerStrategy = context.answerStrategy ?? context.skillPlan?.answerStrategy ?? context.routePlan.answerStrategy ?? "direct";
+  const evidence = renderEvidence(context.evidencePack?.items ?? [], answerStrategy);
 
   return `用户请求：
 ${context.request.message}
 
-RoutePlan：
-${JSON.stringify(context.routePlan, null, 2)}
+RoutePlan（compact）：
+${JSON.stringify(compactRoutePlan(context.routePlan), null, 2)}
 
-AnswerStrategy：${context.answerStrategy ?? context.skillPlan?.answerStrategy ?? context.routePlan.answerStrategy ?? "direct"}
+AnswerStrategy：${answerStrategy}
 
-SkillPlan：
-${skillPlan}
+SkillPlan（compact）：
+${context.skillPlan ? JSON.stringify(compactSkillPlan(context.skillPlan), null, 2) : "无 SkillPlan。"}
 
-SkillResults：
-${skillResults}
+SkillResults（summary）：
+${context.skillResults?.length ? JSON.stringify(summarizeSkillResults(context.skillResults), null, 2) : "无 SkillResults。"}
 
-Observation：
-${observation}
+Observation（compact）：
+${context.observation ? JSON.stringify({ enoughToAnswer: context.observation.enoughToAnswer, missing: context.observation.missing, nextCallCount: context.observation.nextCalls.length, rationale: context.observation.rationale }, null, 2) : "无 Observation。"}
 
-证据包：
+证据包（仅此处包含正文）：
 skillId=${context.evidencePack?.skillId ?? "none"} query=${context.evidencePack?.query ?? "none"}
 ${evidence}
 
-执行结果：
-${execution}
+执行结果（compact）：
+${context.executionResult ? JSON.stringify({ status: context.executionResult.status, capabilityId: context.executionResult.capabilityId, message: context.executionResult.message, error: context.executionResult.error }, null, 2) : "无能力执行结果。"}
 
 约束：
 ${context.constraints.map((item) => `- ${item}`).join("\n")}`;
 }
 
+export function summarizeSkillResults(skillResults: SkillExecutionResult[]): Array<{
+  callId: string;
+  skillId: string;
+  status: SkillExecutionResult["status"];
+  evidenceCount: number;
+  error?: string;
+}> {
+  return skillResults.map((result) => ({
+    callId: result.callId,
+    skillId: result.skillId,
+    status: result.status,
+    evidenceCount: result.evidencePack?.items.length ?? 0,
+    error: result.error
+  }));
+}
+
 export function defaultConstraints(answerStrategy: AnswerStrategy = "direct"): string[] {
-  const base = ["输出中文。"];
+  const base = ["输出中文。"]; 
   if (answerStrategy === "direct") {
     return ["可以正常回答用户问题。", ...base];
   }
@@ -66,4 +71,62 @@ export function defaultConstraints(answerStrategy: AnswerStrategy = "direct"): s
     "对查询等系统动作，可简洁说明证据数量和来源。",
     ...base
   ];
+}
+
+function compactRoutePlan(routePlan: RoutePlan): Record<string, unknown> {
+  return {
+    taskType: routePlan.taskType,
+    answerStrategy: routePlan.answerStrategy,
+    requiresEvidence: routePlan.requiresEvidence,
+    candidateCapabilities: routePlan.candidateCapabilities,
+    rationale: routePlan.rationale
+  };
+}
+
+function compactSkillPlan(skillPlan: SkillPlan): Record<string, unknown> {
+  return {
+    answerStrategy: skillPlan.answerStrategy,
+    requiresEvidence: skillPlan.requiresEvidence,
+    rationale: skillPlan.rationale,
+    calls: skillPlan.calls.map((call) => ({
+      skillId: call.skillId,
+      reason: call.reason,
+      required: call.required,
+      paramsKeys: Object.keys(call.params)
+    }))
+  };
+}
+
+function renderEvidence(items: EvidenceItem[], answerStrategy: AnswerStrategy): string {
+  if (answerStrategy === "direct") {
+    return "direct 策略不注入 evidence 正文。";
+  }
+
+  if (!items.length) {
+    return "无外部证据。";
+  }
+
+  const limit = answerStrategy === "citation" ? 8 : 6;
+  const contentLimit = answerStrategy === "citation" ? 1600 : 1200;
+  return items
+    .slice(0, limit)
+    .map((item, index) => renderEvidenceItem(item, index, contentLimit))
+    .join("\n\n");
+}
+
+function renderEvidenceItem(item: EvidenceItem, index: number, contentLimit: number): string {
+  return [
+    `[${index + 1}]`,
+    `chunkId=${item.chunkId}`,
+    `documentId=${item.documentId}`,
+    `chunkIndex=${item.chunkIndex ?? "unknown"}`,
+    `title=${item.title}`,
+    `source=${item.source ?? "local-db"}`,
+    `score=${item.score}`,
+    `content excerpt:\n${truncate(item.content, contentLimit)}`
+  ].join("\n");
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
 }

@@ -20,6 +20,8 @@ form.addEventListener("submit", async (event) => {
   const assistantMessage = appendAssistantMessage();
   setBusy(true);
 
+  let sseErrorReceived = false;
+
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
@@ -73,18 +75,29 @@ form.addEventListener("submit", async (event) => {
 
       if (event.type === "done") {
         renderDetails(event);
-        status.textContent = "已完成";
-        status.className = "status ok";
+        status.textContent = event.status === "completed_with_fallback" ? "已降级" : "已完成";
+        status.className = event.status === "completed_with_fallback" ? "status warn" : "status ok";
       }
 
       if (event.type === "error") {
-        addProgressItem(assistantMessage.progress, "error", event.error || "流式响应失败", "failed");
-        throw new Error(event.error || "流式响应失败");
+        sseErrorReceived = true;
+        const friendlyMessage = event.friendlyMessage || event.error || "生成模型响应超时，请稍后重试或缩短问题。";
+        addProgressItem(assistantMessage.progress, "error", friendlyMessage, "failed");
+        if (!assistantMessage.answer.dataset.markdown) {
+          renderMarkdownInto(assistantMessage.answer, friendlyMessage);
+        }
+        status.textContent = event.recoverable ? "已降级" : "失败";
+        status.className = event.recoverable ? "status warn" : "status error";
+        break;
       }
     }
   } catch (error) {
-    if (!assistantMessage.answer.dataset.markdown) {
-      renderMarkdownInto(assistantMessage.answer, error instanceof Error ? error.message : "未知错误");
+    if (!sseErrorReceived && !assistantMessage.answer.dataset.markdown) {
+      renderMarkdownInto(assistantMessage.answer, error instanceof Error ? error.message : "网络请求失败，请稍后重试。");
+    }
+    if (!sseErrorReceived) {
+      status.textContent = "失败";
+      status.className = "status error";
     }
   } finally {
     setBusy(false);
