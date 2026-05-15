@@ -42,7 +42,7 @@ function routerSystemPrompt(): string {
 任务类型只能是 chat、rag_chat、skill_call、workflow。
 当用户要求保存、记录、入库、写入数据库时，选择 workflow。
 当用户消息中包含 https://mp.weixin.qq.com/ 开头链接，并要求保存/入库/记录公众号文章内容时，选择 workflow.ingest_wechat_article，并提取 url。
-当用户要求查询数据库、知识库、根据资料回答、检索资料时，选择 rag_chat 或 skill_call。
+当用户要求查询数据库、知识库、根据资料回答、检索资料时，选择 rag_chat 或 skill_call。语义/相似/RAG/向量检索优先 skill.lancedb_query；SQLite/SQL/元数据/标题/来源/最近/精确关键词查询优先 skill.sqlite_query。
 普通解释、写作、分析且不依赖资料时，选择 chat。
 
 输出 JSON 字段：
@@ -117,9 +117,9 @@ function routeByRules(message: string): RoutePlan {
         needsMemory: false,
         needsSkill: true,
         needsWorkflow: false,
-        capabilityQuery: "查询数据库 知识库检索 RAG",
+        capabilityQuery: selectQuerySkill(message) === "skill.sqlite_query" ? "SQLite 精确查询 元数据查询" : "LanceDB 语义检索 知识库 RAG",
         searchQueries: [query],
-        candidateCapabilities: ["skill.query_database"],
+        candidateCapabilities: [selectQuerySkill(message)],
         extractedParams: { query },
         missingParams: query ? [] : ["query"],
         confidence: 0.82,
@@ -148,7 +148,7 @@ function routeByRules(message: string): RoutePlan {
 function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
   const taskType = ["chat", "rag_chat", "skill_call", "workflow"].includes(plan.taskType) ? plan.taskType : "chat";
   const searchQueries = Array.isArray(plan.searchQueries) ? plan.searchQueries.filter(Boolean) : [];
-  const candidateCapabilities = Array.isArray(plan.candidateCapabilities) ? plan.candidateCapabilities : [];
+  const candidateCapabilities = normalizeCandidateCapabilities(plan.candidateCapabilities, message);
   const wechatUrl = extractWeChatArticleUrl(message);
   if (taskType === "workflow" && wechatUrl && !candidateCapabilities.includes("workflow.ingest_wechat_article")) {
     candidateCapabilities.unshift("workflow.ingest_wechat_article");
@@ -157,7 +157,7 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
     candidateCapabilities.push(wechatUrl ? "workflow.ingest_wechat_article" : "workflow.ingest_text_database");
   }
   if ((taskType === "rag_chat" || taskType === "skill_call") && candidateCapabilities.length === 0) {
-    candidateCapabilities.push("skill.query_database");
+    candidateCapabilities.push(selectQuerySkill(message));
   }
 
   return {
@@ -174,6 +174,11 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
     confidence: clamp(Number(plan.confidence) || 0.5, 0, 1),
     rationale: plan.rationale
   };
+}
+
+function normalizeCandidateCapabilities(value: unknown, message: string): string[] {
+  const capabilities = Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  return capabilities.map((capability) => (capability === "skill.query_database" ? selectQuerySkill(message) : capability));
 }
 
 function normalizeExtractedParams(params: unknown, wechatUrl?: string): Record<string, unknown> {
@@ -222,6 +227,13 @@ export function extractQueryPayload(message: string): string | undefined {
     .replace(/^(请你|请|帮我)?\s*/, "")
     .replace(/^(查询数据库|查数据库|检索数据库|查询知识库|检索知识库|从知识库里找|从知识库|根据资料回答)[:：]?\s*/iu, "")
     .trim();
+}
+
+function selectQuerySkill(message: string): string {
+  if (/(sqlite|sql|元数据|metadata|标题|来源|最近|最新|列出|route_logs|conversation_messages|documents|chunks|精确|关键词)/iu.test(message)) {
+    return "skill.sqlite_query";
+  }
+  return "skill.lancedb_query";
 }
 
 function clamp(value: number, min: number, max: number): number {

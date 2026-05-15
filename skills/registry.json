@@ -1,0 +1,38 @@
+{
+  "skills": [
+    {
+      "name": "lancedb-query",
+      "path": "lancedb-query",
+      "capabilityId": "skill.lancedb_query",
+      "examples": [
+        "查询知识库：Router 的职责是什么？",
+        "用 LanceDB 做语义检索",
+        "从资料中找相似片段"
+      ],
+      "requiredParams": [
+        "query"
+      ],
+      "optionalParams": [
+        "projectId",
+        "limit"
+      ]
+    },
+    {
+      "name": "sqlite-query",
+      "path": "sqlite-query",
+      "capabilityId": "skill.sqlite_query",
+      "examples": [
+        "查 SQLite 最近写入的文档",
+        "按标题精确查询资料",
+        "列出数据库里的最新 chunks"
+      ],
+      "requiredParams": [
+        "query"
+      ],
+      "optionalParams": [
+        "projectId",
+        "limit"
+      ]
+    }
+  ]
+}

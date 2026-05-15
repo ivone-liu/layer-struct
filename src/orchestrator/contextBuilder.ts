@@ -21,6 +21,7 @@ RoutePlan：
 ${JSON.stringify(context.routePlan, null, 2)}
 
 证据包：
+skillId=${context.evidencePack?.skillId ?? "none"} query=${context.evidencePack?.query ?? "none"}
 ${evidence}
 
 执行结果：

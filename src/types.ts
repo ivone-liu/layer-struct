@@ -62,6 +62,7 @@ export interface EvidenceItem {
 
 export interface EvidencePack {
   query: string;
+  skillId?: string;
   items: EvidenceItem[];
 }
 

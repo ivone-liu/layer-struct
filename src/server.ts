@@ -113,7 +113,7 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === "POST" && url.pathname === "/api/search") {
-      const body = await readJsonBody<{ query?: string; projectId?: string; limit?: number }>(request);
+      const body = await readJsonBody<{ query?: string; projectId?: string; limit?: number; skillId?: string }>(request);
       if (!body.query?.trim()) {
         return json(response, 400, { error: "query is required" });
       }
@@ -121,7 +121,8 @@ const server = createServer(async (request, response) => {
       const result = await documents.search({
         query: body.query,
         projectId: body.projectId || config.defaultProjectId,
-        limit: body.limit
+        limit: body.limit,
+        skillId: body.skillId
       });
       return json(response, 200, result);
     }
