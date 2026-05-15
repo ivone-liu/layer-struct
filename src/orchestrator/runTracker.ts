@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AiTimeoutError } from "../ai/openAiCompatibleClient.js";
 import { SqliteStore } from "../storage/sqliteStore.js";
 import type { ChatStreamCallbacks, ChatStreamEvent, EvidencePack, ExecutionResult, RoutePlan, RunStepName, SkillCall, SkillExecutionResult, SkillObservation, SkillPlan } from "../types.js";
 
@@ -116,14 +117,24 @@ export class RunTracker {
     await this.emit({ type: "assistant_delta", runId: this.runId, content });
   }
 
-  async done(payload: Omit<Extract<ChatStreamEvent, { type: "done" }>, "type" | "runId" | "status">): Promise<void> {
-    this.sqlite.updateRunStatus(this.runId, "completed");
-    await this.emit({ type: "done", runId: this.runId, status: "completed", ...payload });
+  async done(payload: Omit<Extract<ChatStreamEvent, { type: "done" }>, "type" | "runId" | "status">, status: "completed" | "completed_with_fallback" = "completed"): Promise<void> {
+    this.sqlite.updateRunStatus(this.runId, status);
+    await this.emit({ type: "done", runId: this.runId, status, ...payload });
   }
 
   async error(error: unknown): Promise<void> {
+    const rawError = formatError(error);
+    const friendlyMessage = formatUserFacingError(error);
     this.sqlite.updateRunStatus(this.runId, "failed");
-    await this.emit({ type: "error", runId: this.runId, status: "failed", error: formatError(error) });
+    await this.emit({
+      type: "error",
+      runId: this.runId,
+      status: "failed",
+      error: friendlyMessage,
+      friendlyMessage,
+      recoverable: isTimeoutLikeError(error),
+      debug: { rawError }
+    });
   }
 
   private ensureStep(
@@ -166,6 +177,21 @@ export class RunTracker {
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function formatUserFacingError(error: unknown): string {
+  if (error instanceof AiTimeoutError) {
+    return "生成模型响应超时，请稍后重试或缩短问题。";
+  }
+  const raw = formatError(error);
+  if (isTimeoutLikeError(error) || raw.includes("This operation was aborted")) {
+    return "生成请求被超时中断，请稍后重试或缩短问题。";
+  }
+  return "处理过程中出现错误。";
+}
+
+function isTimeoutLikeError(error: unknown): boolean {
+  return error instanceof AiTimeoutError || error instanceof Error && error.name === "AbortError";
 }
 
 function renderSkillStart(skillId: string): string {

@@ -15,7 +15,7 @@ import type {
   SkillPlan,
   StoredDocumentInput
 } from "../types.js";
-import { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
+import { AiTimeoutError, OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
 import { buildFinalPrompt, defaultConstraints } from "./contextBuilder.js";
 import { extractWritePayload, Router } from "./router.js";
 import { DocumentService } from "../services/documentService.js";
@@ -90,6 +90,7 @@ export class Orchestrator {
     let executionResult: ExecutionResult | undefined;
     let evidencePack: EvidencePack | undefined;
     let finalAnswer = "";
+    let completedWithFallback = false;
 
     try {
       await tracker.runStarted("已收到问题，正在判断处理方式。");
@@ -131,16 +132,35 @@ export class Orchestrator {
 
         await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation });
         await tracker.stepStarted("generation", "正在生成最终回答。");
-        for await (const chunk of this.generateAnswerStreamFromPrepared(generationInput)) {
-          finalAnswer += chunk;
-          await tracker.answerDelta(chunk);
+        let usedFallback = false;
+        try {
+          for await (const chunk of this.generateAnswerStreamFromPrepared(generationInput)) {
+            finalAnswer += chunk;
+            await tracker.answerDelta(chunk);
+          }
+          await tracker.stepCompleted("generation", "回答生成完成。", { answerLength: finalAnswer.length });
+        } catch (error) {
+          if (!isTimeoutError(error)) {
+            throw error;
+          }
+          usedFallback = true;
+          completedWithFallback = true;
+          finalAnswer = renderGenerationFallback(error, evidencePack);
+          await tracker.answerDelta(finalAnswer);
+          await tracker.stepCompleted("generation", "生成模型超时，已返回降级结果。", {
+            fallback: true,
+            answerLength: finalAnswer.length,
+            error: error instanceof Error ? error.message : String(error)
+          });
         }
-        await tracker.stepCompleted("generation", "回答生成完成。", { answerLength: finalAnswer.length });
+        if (usedFallback) {
+          await tracker.metadata({ fallback: true }, "已返回降级结果。");
+        }
       }
 
       this.insertAssistantMessage(context.sessionId, finalAnswer);
       const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation };
-      await tracker.done(result);
+      await tracker.done(result, completedWithFallback ? "completed_with_fallback" : "completed");
       return result;
     } catch (error) {
       await tracker.error(error);
@@ -366,6 +386,35 @@ export class Orchestrator {
 type GenerationInput =
   | { kind: "static"; answer: string }
   | { kind: "model"; history: Array<{ role: "user" | "assistant"; content: string }>; prompt: string };
+
+
+export function isTimeoutError(error: unknown): boolean {
+  if (error instanceof AiTimeoutError) {
+    return true;
+  }
+  if (error instanceof Error) {
+    return error.name === "AbortError" || error.message.includes("This operation was aborted");
+  }
+  return false;
+}
+
+function renderGenerationFallback(error: unknown, evidencePack?: EvidencePack): string {
+  if (!evidencePack?.items.length) {
+    return "最终生成模型响应超时，请稍后重试或缩短问题。";
+  }
+
+  const items = evidencePack.items.slice(0, 5).map((item, index) => {
+    const excerpt = item.content.length > 500 ? `${item.content.slice(0, 500)}…` : item.content;
+    return [
+      `${index + 1}. ${item.title}`,
+      `- source: ${item.source ?? "local-db"}`,
+      `- chunkIndex: ${item.chunkIndex ?? "unknown"}`,
+      `- 摘要: ${excerpt}`
+    ].join("\n");
+  });
+  const detail = error instanceof AiTimeoutError ? `（${error.phase} 超时 ${error.timeoutMs}ms）` : "";
+  return [`最终生成模型超时${detail}。已先返回本次检索到的资料摘要：`, ...items].join("\n\n");
+}
 
 function buildFinalMessages(history: Array<{ role: "user" | "assistant"; content: string }>, prompt: string) {
   return [

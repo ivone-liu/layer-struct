@@ -31,6 +31,11 @@ AI_ROUTER_MODEL=...
 AI_CHAT_MODEL=...
 AI_EMBEDDING_MODEL=...
 AI_EMBEDDING_DIM=1536
+AI_REQUEST_TIMEOUT_MS=60000
+AI_STREAM_CONNECT_TIMEOUT_MS=30000
+AI_STREAM_FIRST_TOKEN_TIMEOUT_MS=60000
+AI_STREAM_IDLE_TIMEOUT_MS=60000
+AI_STREAM_TOTAL_TIMEOUT_MS=180000
 # 可选：WeSpy 公众号文章抓取配置
 WESPY_COMMAND=wespy
 WESPY_OUTPUT_DIR=./data/wespy
@@ -48,6 +53,17 @@ npm run dev
 ```text
 http://localhost:3000
 ```
+
+
+### AI 请求超时配置
+
+- `AI_REQUEST_TIMEOUT_MS=60000`：用于普通非流式 AI 请求，例如路由、Embedding 或一次性 Chat 请求。
+- `AI_STREAM_CONNECT_TIMEOUT_MS=30000`：用于流式最终生成的连接建立阶段。
+- `AI_STREAM_FIRST_TOKEN_TIMEOUT_MS=60000`：用于流式响应 body 开始读取后，到第一个有效 token 之间的等待时间。
+- `AI_STREAM_IDLE_TIMEOUT_MS=60000`：用于流式生成过程中相邻 chunk/token 之间的空闲等待时间。
+- `AI_STREAM_TOTAL_TIMEOUT_MS=180000`：用于流式最终生成的总时长上限。长回答或大证据包场景建议适当提高该值。
+
+流式最终生成使用 `AI_STREAM_*` 分阶段超时，不再由单一 30 秒总超时控制；普通请求仍使用 `AI_REQUEST_TIMEOUT_MS`。
 
 ## 使用示例
 
