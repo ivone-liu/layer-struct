@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import type { CapabilityDefinition, RequestContext, RoutePlan, SessionState, SkillCall, SkillPlan } from "../types.js";
+import type { CapabilityDefinition, DocumentResolution, MemoryHit, RequestContext, RoutePlan, SessionState, SkillCall, SkillPlan } from "../types.js";
 
 export class SkillPlanner {
   plan(
     context: RequestContext,
     routePlan: RoutePlan,
     sessionState?: SessionState,
-    _capabilities: CapabilityDefinition[] = []
+    _capabilities: CapabilityDefinition[] = [],
+    documentResolution?: DocumentResolution,
+    memoryHits: MemoryHit[] = []
   ): SkillPlan {
     if (routePlan.needsWorkflow || routePlan.taskType === "workflow") {
       return {
@@ -44,7 +46,19 @@ export class SkillPlanner {
       calls.push({ id: randomUUID(), skillId, reason, params, required });
     };
 
-    const documentParams = sessionState?.currentDocumentId ? { documentId: sessionState.currentDocumentId } : {};
+    const memoryDocumentId = memoryHits.find((hit) => hit.kind === "document_anchor" && hit.documentId)?.documentId;
+    const resolvedDocumentId = documentResolution?.status === "resolved" ? documentResolution.documentId : memoryDocumentId;
+    const documentParams = resolvedDocumentId ? { documentId: resolvedDocumentId } : sessionState?.currentDocumentId ? { documentId: sessionState.currentDocumentId } : {};
+
+    if (documentResolution?.status === "ambiguous") {
+      return {
+        answerStrategy: "direct",
+        calls: [],
+        requiresEvidence: false,
+        canAnswerWithoutSkill: true,
+        rationale: "多个 memory/document 候选分数接近，需要先让用户选择文档。"
+      };
+    }
 
     if (citation) {
       addCall("skill.sqlite_query", "用户需要原文段落或出处，需要精确读取本地文档/chunks", {
@@ -61,11 +75,11 @@ export class SkillPlanner {
       };
     }
 
-    if (mentionsCurrent && sessionState?.currentDocumentId) {
+    if ((mentionsCurrent && sessionState?.currentDocumentId) || resolvedDocumentId) {
       addCall("skill.sqlite_query", "用户指向刚才/这篇文章，先锁定并读取当前会话文档 chunks", {
         query,
         limit: 8,
-        documentId: sessionState.currentDocumentId
+        documentId: resolvedDocumentId ?? sessionState!.currentDocumentId
       });
       if (semantic) {
         addCall("skill.lancedb_query", "用户需要基于语义召回资料后总结", { query, projectId: context.projectId, limit: 6 }, false);
@@ -80,9 +94,14 @@ export class SkillPlanner {
     }
 
     if (recentOrList || routePlan.candidateCapabilities.includes("skill.sqlite_query")) {
-      addCall("skill.sqlite_query", "用户需要最近保存、标题、来源、documentId 或精确关键词查询", { query, projectId: context.projectId, limit: 8 });
+      addCall("skill.sqlite_query", "用户需要最近保存、标题、来源、documentId 或精确关键词查询", { query, projectId: context.projectId, limit: 8, ...documentParams });
     } else {
-      addCall("skill.lancedb_query", "用户需要基于语义召回资料后总结", { query, projectId: context.projectId, limit: 6 });
+      if (resolvedDocumentId) {
+        addCall("skill.sqlite_query", "memory/document resolver 已定位文档，先读取原文 chunks", { query, limit: 8, documentId: resolvedDocumentId });
+        if (semantic) addCall("skill.lancedb_query", "语义召回作为补充，不作为原文引用依据", { query, projectId: context.projectId, limit: 6 }, false);
+      } else {
+        addCall("skill.lancedb_query", "用户需要基于语义召回资料后总结", { query, projectId: context.projectId, limit: 6 });
+      }
     }
 
     return {

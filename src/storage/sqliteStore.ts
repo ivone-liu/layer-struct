@@ -3,6 +3,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   EvidenceItem,
+  ExpandedEvidenceItem,
+  MemoryHit,
+  MemoryItem,
   RequestContext,
   RoutePlan,
   RunStatus,
@@ -101,6 +104,36 @@ export class SqliteStore {
       .prepare("SELECT * FROM documents ORDER BY created_at DESC LIMIT ?")
       .all(limit) as unknown as DocumentRow[];
     return rows.map(mapDocument);
+  }
+
+
+  searchDocuments(params: { query: string; projectId: string; limit?: number }): import("../types.js").DocumentCandidate[] {
+    const limit = params.limit ?? 8;
+    const trimmed = params.query.trim();
+    const terms = trimmed.split(/\s+/).filter(Boolean).slice(0, 6);
+    if (!trimmed) {
+      return this.listRecentDocuments(limit)
+        .filter((doc) => doc.projectId === params.projectId)
+        .map((doc, index) => ({ documentId: doc.id, title: doc.title, source: doc.source, projectId: doc.projectId, score: limit - index, reason: "recent_document" }));
+    }
+    const pattern = `%${escapeLike(trimmed)}%`;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM documents
+         WHERE project_id = ?
+           AND (title LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(params.projectId, pattern, pattern, pattern, limit) as unknown as DocumentRow[];
+    return rows.map((row) => ({
+      documentId: row.id,
+      title: row.title,
+      source: row.source ?? undefined,
+      projectId: row.project_id,
+      score: documentKeywordScore(row, terms),
+      reason: "sqlite_document_keyword"
+    }));
   }
 
   getSessionState(sessionId: string): SessionState | undefined {
@@ -215,6 +248,148 @@ export class SqliteStore {
       .all(projectId, limit) as unknown as ChunkJoinRow[];
 
     return rows.map((row, index) => mapChunkEvidence(row, index));
+  }
+
+
+  insertMemoryItem(item: MemoryItem): MemoryItem {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO memory_items (
+          id, kind, user_id, project_id, session_id, document_id, title, source, content, summary,
+          entities_json, topics_json, metadata_json, score, hit_count, last_hit_at, last_decay_at,
+          is_pinned, is_deleted, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        item.id,
+        item.kind,
+        item.userId ?? null,
+        item.projectId,
+        item.sessionId ?? null,
+        item.documentId ?? null,
+        item.title ?? null,
+        item.source ?? null,
+        item.content,
+        item.summary ?? null,
+        JSON.stringify(item.entities),
+        JSON.stringify(item.topics),
+        JSON.stringify(item.metadata),
+        item.score,
+        item.hitCount,
+        item.lastHitAt ?? null,
+        item.lastDecayAt ?? null,
+        item.isPinned ? 1 : 0,
+        item.isDeleted ? 1 : 0,
+        item.createdAt,
+        item.updatedAt
+      );
+    return item;
+  }
+
+  getMemoryItem(id: string): MemoryItem | undefined {
+    const row = this.db.prepare("SELECT * FROM memory_items WHERE id = ?").get(id) as MemoryRow | undefined;
+    return row ? mapMemoryItem(row) : undefined;
+  }
+
+  listMemoryItemsByIds(ids: string[]): MemoryItem[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT * FROM memory_items WHERE id IN (${placeholders})`).all(...ids) as unknown as MemoryRow[];
+    const byId = new Map(rows.map((row) => [row.id, mapMemoryItem(row)]));
+    return ids.map((id) => byId.get(id)).filter((item): item is MemoryItem => Boolean(item));
+  }
+
+  markMemoryHit(id: string, boost = 1): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(`UPDATE memory_items SET hit_count = hit_count + 1, score = score + ?, last_hit_at = ?, updated_at = ? WHERE id = ?`)
+      .run(boost, now, now, id);
+  }
+
+  decayMemoryItems(params: { decayAmount: number; deleteThreshold: number; deleteAfterDays: number; staleAfterDays?: number }): { decayed: number; deleted: number } {
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const staleBeforeIso = new Date(now.getTime() - (params.staleAfterDays ?? 1) * 86400000).toISOString();
+    const deleteBeforeIso = new Date(now.getTime() - params.deleteAfterDays * 86400000).toISOString();
+    const decayed = this.db
+      .prepare(
+        `UPDATE memory_items
+         SET score = score - ?, last_decay_at = ?, updated_at = ?
+         WHERE is_pinned = 0 AND is_deleted = 0
+           AND (last_hit_at IS NULL OR last_hit_at <= ?)`
+      )
+      .run(params.decayAmount, nowIso, nowIso, staleBeforeIso).changes;
+    const deleted = this.db
+      .prepare(
+        `UPDATE memory_items
+         SET is_deleted = 1, updated_at = ?
+         WHERE is_pinned = 0 AND is_deleted = 0 AND score <= ? AND COALESCE(last_hit_at, created_at) <= ?`
+      )
+      .run(nowIso, params.deleteThreshold, deleteBeforeIso).changes;
+    return { decayed: Number(decayed), deleted: Number(deleted) };
+  }
+
+  searchMemoryKeyword(params: { query: string; projectId: string; userId?: string; limit?: number }): MemoryHit[] {
+    const limit = params.limit ?? 6;
+    const terms = params.query.trim().split(/\s+/).filter(Boolean).slice(0, 8);
+    if (terms.length === 0) return [];
+    const pattern = `%${escapeLike(params.query.trim())}%`;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM memory_items
+         WHERE project_id = ? AND is_deleted = 0
+           AND (? IS NULL OR user_id IS NULL OR user_id = ?)
+           AND (title LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR entities_json LIKE ? ESCAPE '\\' OR topics_json LIKE ? ESCAPE '\\')
+         ORDER BY score DESC, hit_count DESC, updated_at DESC
+         LIMIT ?`
+      )
+      .all(params.projectId, params.userId ?? null, params.userId ?? null, pattern, pattern, pattern, pattern, pattern, pattern, limit) as unknown as MemoryRow[];
+    return rows.map((row) => memoryItemToHit(mapMemoryItem(row), keywordScoreMemory(row, terms), "keyword_memory_fallback"));
+  }
+
+  getNeighborChunks(params: { documentId: string; chunkIndex: number; before?: number; after?: number }): StoredChunk[] {
+    const start = Math.max(0, params.chunkIndex - (params.before ?? 1));
+    const end = params.chunkIndex + (params.after ?? 1);
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM chunks
+         WHERE document_id = ? AND chunk_index BETWEEN ? AND ?
+         ORDER BY chunk_index ASC`
+      )
+      .all(params.documentId, start, end) as unknown as ChunkRow[];
+    return rows.map(mapChunk);
+  }
+
+  expandEvidenceItems(items: EvidenceItem[], window = 1): ExpandedEvidenceItem[] {
+    const seen = new Set<string>();
+    const expanded: ExpandedEvidenceItem[] = [];
+    for (const item of items) {
+      if (item.chunkIndex === undefined) {
+        expanded.push({ ...item, centerChunk: true, centerChunkIndex: item.chunkIndex, expandedContent: `命中段：\n${item.content}` });
+        continue;
+      }
+      const chunkIndex = item.chunkIndex;
+      const key = `${item.documentId}:${chunkIndex}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const neighbors = this.getNeighborChunks({ documentId: item.documentId, chunkIndex, before: window, after: window });
+      const before = neighbors.filter((chunk) => chunk.chunkIndex < chunkIndex).map((chunk) => chunk.content).join("\n\n");
+      const center = neighbors.find((chunk) => chunk.chunkIndex === chunkIndex)?.content ?? item.content;
+      const after = neighbors.filter((chunk) => chunk.chunkIndex > chunkIndex).map((chunk) => chunk.content).join("\n\n");
+      const parts = [];
+      if (before) parts.push(`上文：\n${before}`);
+      parts.push(`命中段：\n${center}`);
+      if (after) parts.push(`下文：\n${after}`);
+      expanded.push({
+        ...item,
+        centerChunk: true,
+        centerChunkIndex: item.chunkIndex,
+        contextBefore: before || undefined,
+        contextAfter: after || undefined,
+        expandedContent: parts.join("\n\n")
+      });
+    }
+    return expanded;
   }
 
   insertMessage(params: {
@@ -429,6 +604,35 @@ export class SqliteStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS memory_items (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        user_id TEXT,
+        project_id TEXT NOT NULL,
+        session_id TEXT,
+        document_id TEXT,
+        title TEXT,
+        source TEXT,
+        content TEXT NOT NULL,
+        summary TEXT,
+        entities_json TEXT NOT NULL,
+        topics_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        score REAL NOT NULL,
+        hit_count INTEGER NOT NULL,
+        last_hit_at TEXT,
+        last_decay_at TEXT,
+        is_pinned INTEGER NOT NULL,
+        is_deleted INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_memory_project_kind ON memory_items(project_id, kind);
+      CREATE INDEX IF NOT EXISTS idx_memory_document ON memory_items(document_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_user ON memory_items(user_id);
+      CREATE INDEX IF NOT EXISTS idx_memory_deleted_score ON memory_items(is_deleted, score);
+
       CREATE TABLE IF NOT EXISTS route_logs (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -496,6 +700,38 @@ interface SessionStateRow {
   updated_at: string;
 }
 
+interface ChunkRow {
+  id: string;
+  document_id: string;
+  chunk_index: number;
+  content: string;
+  created_at: string;
+}
+
+interface MemoryRow {
+  id: string;
+  kind: MemoryItem["kind"];
+  user_id: string | null;
+  project_id: string;
+  session_id: string | null;
+  document_id: string | null;
+  title: string | null;
+  source: string | null;
+  content: string;
+  summary: string | null;
+  entities_json: string;
+  topics_json: string;
+  metadata_json: string;
+  score: number;
+  hit_count: number;
+  last_hit_at: string | null;
+  last_decay_at: string | null;
+  is_pinned: number;
+  is_deleted: number;
+  created_at: string;
+  updated_at: string;
+}
+
 interface ChunkJoinRow {
   id: string;
   document_id: string;
@@ -555,6 +791,78 @@ function escapeLike(value: string): string {
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+
+function mapChunk(row: ChunkRow): StoredChunk {
+  return { id: row.id, documentId: row.document_id, chunkIndex: row.chunk_index, content: row.content, createdAt: row.created_at };
+}
+
+function mapMemoryItem(row: MemoryRow): MemoryItem {
+  return {
+    id: row.id,
+    kind: row.kind,
+    userId: row.user_id ?? undefined,
+    projectId: row.project_id,
+    sessionId: row.session_id ?? undefined,
+    documentId: row.document_id ?? undefined,
+    title: row.title ?? undefined,
+    source: row.source ?? undefined,
+    content: row.content,
+    summary: row.summary ?? undefined,
+    entities: safeParseStringArray(row.entities_json),
+    topics: safeParseStringArray(row.topics_json),
+    metadata: safeParseRecord(row.metadata_json),
+    score: row.score,
+    hitCount: row.hit_count,
+    lastHitAt: row.last_hit_at ?? undefined,
+    lastDecayAt: row.last_decay_at ?? undefined,
+    isPinned: row.is_pinned === 1,
+    isDeleted: row.is_deleted === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function memoryItemToHit(item: MemoryItem, vectorScore: number, reason: string): MemoryHit {
+  return {
+    memoryId: item.id,
+    kind: item.kind,
+    projectId: item.projectId,
+    userId: item.userId,
+    sessionId: item.sessionId,
+    documentId: item.documentId,
+    title: item.title,
+    source: item.source,
+    content: item.content,
+    summary: item.summary,
+    entities: item.entities,
+    topics: item.topics,
+    score: item.score,
+    vectorScore,
+    hitCount: item.hitCount,
+    reason
+  };
+}
+
+function keywordScoreMemory(row: MemoryRow, terms: string[]): number {
+  const haystack = `${row.title ?? ""} ${row.source ?? ""} ${row.content} ${row.summary ?? ""} ${row.entities_json} ${row.topics_json}`.toLowerCase();
+  return terms.reduce((score, term) => score + (haystack.includes(term.toLowerCase()) ? 1 : 0), 0);
+}
+
+function documentKeywordScore(row: DocumentRow, terms: string[]): number {
+  const haystack = `${row.title} ${row.source ?? ""} ${row.content}`.toLowerCase();
+  return terms.reduce((score, term) => score + (haystack.includes(term.toLowerCase()) ? 1 : 0), 0);
+}
+
+function safeParseStringArray(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 function safeParseRecord(value: string | null): Record<string, unknown> {

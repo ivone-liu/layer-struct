@@ -7,6 +7,7 @@ import { loadConfig } from "./config/env.js";
 import { Orchestrator } from "./orchestrator/orchestrator.js";
 import { formatUserFacingError } from "./orchestrator/runTracker.js";
 import { DocumentService } from "./services/documentService.js";
+import { MemoryService } from "./services/memoryService.js";
 import { LanceVectorStore } from "./storage/lanceVectorStore.js";
 import { SqliteStore } from "./storage/sqliteStore.js";
 import type { ChatStreamEvent, StoredDocumentInput } from "./types.js";
@@ -16,9 +17,10 @@ await mkdir(config.dataDir, { recursive: true });
 
 const sqlite = new SqliteStore(config.sqlitePath);
 const ai = new OpenAiCompatibleClient(config.ai);
-const vectors = new LanceVectorStore(config.lanceDbUri, config.lanceDbTable);
-const documents = new DocumentService(sqlite, vectors, ai);
-const orchestrator = new Orchestrator(config, sqlite, documents, ai);
+const vectors = new LanceVectorStore(config.lanceDbUri, config.lanceDbDocumentTable);
+const documents = new DocumentService(sqlite, vectors, ai, config);
+const memory = new MemoryService(sqlite, vectors, ai, config);
+const orchestrator = new Orchestrator(config, sqlite, documents, ai, memory);
 
 const publicDir = path.resolve(process.cwd(), "public");
 
@@ -41,7 +43,11 @@ const server = createServer(async (request, response) => {
         storage: {
           sqlitePath: config.sqlitePath,
           lanceDbUri: config.lanceDbUri,
-          lanceDbTable: config.lanceDbTable
+          lanceDbTable: config.lanceDbTable,
+          lanceDbDocumentTable: config.lanceDbDocumentTable,
+          lanceDbMemoryTable: config.lanceDbMemoryTable,
+          lanceDbSessionTable: config.lanceDbSessionTable,
+          lanceDbCapabilityTable: config.lanceDbCapabilityTable
         }
       });
     }
@@ -155,7 +161,18 @@ server.listen(config.port, () => {
   console.log(`AI Orchestrator listening on http://localhost:${config.port}`);
 });
 
+const memoryDecayIntervalMs = Math.max(1, config.memory.decayIntervalHours) * 60 * 60 * 1000;
+const memoryDecayTimer = setTimeout(() => {
+  const interval = setInterval(() => {
+    memory.decay().catch((error) => console.warn("memory decay failed", error));
+  }, memoryDecayIntervalMs);
+  interval.unref?.();
+  memory.decay().catch((error) => console.warn("memory decay failed", error));
+}, 60000);
+memoryDecayTimer.unref?.();
+
 process.on("SIGINT", () => {
+  clearTimeout(memoryDecayTimer);
   sqlite.close();
   server.close();
 });

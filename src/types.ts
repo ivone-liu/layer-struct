@@ -7,6 +7,14 @@ export type RunStepName = "intake" | "router" | "execution" | "retrieval" | "con
 export type RunStepStatus = "running" | "completed" | "failed";
 export type AnswerStrategy = "direct" | "rag" | "citation" | "workflow" | "multi_step";
 
+export type MemoryKind =
+  | "document_anchor"
+  | "session_summary"
+  | "user_preference"
+  | "correction"
+  | "workflow_trace";
+
+
 export interface RequestContext {
   requestId: string;
   sessionId: string;
@@ -67,6 +75,7 @@ export interface RoutePlan {
   targetDocumentTitle?: string;
   resolvedQuery?: string;
   skillPlan?: SkillPlan;
+  documentResolution?: DocumentResolution;
 }
 
 export interface CapabilityDefinition {
@@ -96,6 +105,7 @@ export interface EvidenceItem {
   chunkId: string;
   documentId: string;
   chunkIndex?: number;
+  centerChunk?: boolean;
   title: string;
   source?: string;
   content: string;
@@ -103,10 +113,81 @@ export interface EvidenceItem {
   projectId: string;
 }
 
+export interface ExpandedEvidenceItem extends EvidenceItem {
+  contextBefore?: string;
+  contextAfter?: string;
+  expandedContent: string;
+  centerChunkIndex?: number;
+}
+
+export interface MemoryItem {
+  id: string;
+  kind: MemoryKind;
+  userId?: string;
+  projectId: string;
+  sessionId?: string;
+  documentId?: string;
+  title?: string;
+  source?: string;
+  content: string;
+  summary?: string;
+  entities: string[];
+  topics: string[];
+  metadata: Record<string, unknown>;
+  score: number;
+  hitCount: number;
+  lastHitAt?: string;
+  lastDecayAt?: string;
+  isPinned: boolean;
+  isDeleted: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryHit {
+  memoryId: string;
+  kind: MemoryKind;
+  projectId: string;
+  userId?: string;
+  sessionId?: string;
+  documentId?: string;
+  title?: string;
+  source?: string;
+  content: string;
+  summary?: string;
+  entities: string[];
+  topics: string[];
+  score: number;
+  vectorScore: number;
+  hitCount: number;
+  reason: string;
+}
+
+export interface DocumentCandidate {
+  documentId: string;
+  title: string;
+  source?: string;
+  projectId: string;
+  score: number;
+  reason: string;
+}
+
+export interface DocumentResolution {
+  status: "resolved" | "ambiguous" | "not_found";
+  documentId?: string;
+  title?: string;
+  source?: string;
+  reason: string;
+  candidates: DocumentCandidate[];
+}
+
 export interface EvidencePack {
   query: string;
   skillId?: string;
   items: EvidenceItem[];
+  expandedItems?: ExpandedEvidenceItem[];
+  memoryHits?: MemoryHit[];
+  retrievalSources?: string[];
 }
 
 export interface ExecutionResult {
@@ -135,6 +216,7 @@ export interface FinalContext {
   observation?: SkillObservation;
   answerStrategy?: AnswerStrategy;
   constraints: string[];
+  memoryHits?: MemoryHit[];
 }
 
 export interface ChatResponse {
@@ -145,6 +227,7 @@ export interface ChatResponse {
   skillPlan?: SkillPlan;
   skillResults?: SkillExecutionResult[];
   observation?: SkillObservation;
+  memoryHits?: MemoryHit[];
 }
 
 export type DocumentWriteProgressEvent =
@@ -198,6 +281,7 @@ export type ChatStreamEvent =
       skillPlan?: SkillPlan;
       skillResults?: SkillExecutionResult[];
       observation?: SkillObservation;
+      memoryHits?: MemoryHit[];
     }
   | {
       type: "done";
@@ -210,7 +294,12 @@ export type ChatStreamEvent =
       skillPlan?: SkillPlan;
       skillResults?: SkillExecutionResult[];
       observation?: SkillObservation;
+      memoryHits?: MemoryHit[];
     }
+  | { type: "memory_started"; runId: string; visibleMessage: string }
+  | { type: "memory_completed"; runId: string; visibleMessage: string; memoryHits: MemoryHit[] }
+  | { type: "document_resolved"; runId: string; visibleMessage: string; documentResolution: DocumentResolution }
+  | { type: "document_ambiguous"; runId: string; visibleMessage: string; documentResolution: DocumentResolution }
   | { type: "error"; runId?: string; status?: RunStatus; error: string; friendlyMessage?: string; recoverable?: boolean; debug?: Record<string, unknown> };
 
 export interface ChatStreamCallbacks {

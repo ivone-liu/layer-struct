@@ -147,3 +147,57 @@ npm run skills:install -- https://github.com/anthropics/skills/tree/main/skills/
 注册新 Skill 时，安装脚本会按 Anthropic《The Complete Guide to Building Skills for Claude》的核心格式要求做本地校验：`SKILL.md` 必须大小写完全匹配、包含 YAML frontmatter，`name` 必须是 kebab-case 且与注册目录一致，`description` 必须说明“做什么”和“何时使用”、长度小于 1024 字符且 frontmatter 不包含 XML 尖括号；Skill 目录内不能放 `README.md`，额外资料应放在 `SKILL.md` 或 `references/`。校验通过后，脚本会调用 OpenAI-compatible 大模型为该 Skill 生成确定结构的注册表基础信息，包括 `examples`、`requiredParams`、`optionalParams`、风险/成本等级和是否需要确认。模型调用使用 `temperature: 0`、`response_format: {"type":"json_object"}`，并在写入注册表前对 JSON 字段做归一化校验，方便 Router 后续稳定选择和调用。
 
 Skill 注册元数据生成依赖以下环境变量：`AI_API_KEY`（或 `OPENAI_API_KEY`）、`AI_SKILL_REGISTRY_MODEL`（优先；也可回退到 `AI_ROUTER_MODEL`、`AI_CHAT_MODEL` 或 `OPENAI_MODEL`），以及可选的 `AI_BASE_URL`（或 `OPENAI_BASE_URL`，默认 `https://api.openai.com/v1`）和 `AI_SKILL_REGISTRY_TIMEOUT_MS`（默认回退到 `AI_REQUEST_TIMEOUT_MS` 或 60000）。安装脚本会自动读取项目当前工作目录下的 `.env` 并补齐缺失的进程环境变量；shell 中已存在的环境变量优先级更高。如果未配置 API key 或模型，安装脚本会拒绝注册并提示缺失配置。
+
+## Memory RAG、多索引检索与 Chunk Expansion
+
+本项目现在将搜索链路升级为“三段式”：
+
+1. **Memory RAG 找导航锚点**：写入文档后会创建 `document_anchor` 记忆，用于跨 session 找回历史文档、会话摘要、偏好和修正等导航线索。
+2. **Document RAG 找原文证据**：当用户要求“原文引用/出处/文中怎么说”时，Memory 只能帮助定位 `documentId`，最终证据必须回到 SQLite `chunks` 或 LanceDB `document_chunks` 对应的原文 chunk。
+3. **Chunk Expansion 补上下文**：命中一个 chunk 后，最终 prompt 会自动带上前后相邻 chunk（默认前后各 1 个），提高引用上下文完整度。
+
+### LanceDB 多索引表
+
+LanceDB 现在按用途拆分为多张表：
+
+- `document_chunks`：文档切片向量，作为原文 RAG 的主要向量索引。
+- `memory_items`：跨 session memory 向量，保存 document anchor、session summary、用户偏好、纠错和工作流轨迹等导航线索。
+- `session_summaries`：预留给会话摘要索引。
+- `capability_index`：预留给能力/Skill 检索索引。
+
+环境变量：
+
+```env
+LANCEDB_TABLE=document_chunks
+LANCEDB_DOCUMENT_TABLE=document_chunks
+LANCEDB_MEMORY_TABLE=memory_items
+LANCEDB_SESSION_TABLE=session_summaries
+LANCEDB_CAPABILITY_TABLE=capability_index
+```
+
+`LANCEDB_TABLE` 仍保留兼容旧逻辑；新代码优先使用 `LANCEDB_DOCUMENT_TABLE`。
+
+### Memory 不是原文证据
+
+Memory 的职责是“导航”，例如根据“罗福莉”找回之前保存过的文章 `documentId`。它不能被当作原文引用来源；如果用户要求引用、摘录、出处或“文中怎么说”，系统必须查询 `document_chunks` / SQLite `chunks`，没有原文 evidence 时会拒绝编造引用。
+
+### 记忆命中增强与衰减
+
+Memory 命中后会提升 `hit_count` 与 `score`；服务启动后会在本地进程内定时衰减长期未命中的非 pinned memory，并在分数过低且长期不用时软删除。
+
+```env
+MEMORY_DECAY_INTERVAL_HOURS=24
+MEMORY_DECAY_AMOUNT=1
+MEMORY_DELETE_SCORE_THRESHOLD=-5
+MEMORY_DELETE_AFTER_DAYS=30
+MEMORY_HIT_BOOST=1
+MEMORY_DEFAULT_SCORE=5
+```
+
+### Chunk Expansion
+
+`EVIDENCE_CONTEXT_WINDOW` 控制每个命中 chunk 前后扩展多少个相邻 chunk。默认 `1` 表示命中 `chunkIndex=12` 时，最终 prompt 会优先使用包含 11、12、13 的 expanded evidence。
+
+```env
+EVIDENCE_CONTEXT_WINDOW=1
+```

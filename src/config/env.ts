@@ -9,6 +9,19 @@ export interface AppConfig {
   sqlitePath: string;
   lanceDbUri: string;
   lanceDbTable: string;
+  lanceDbDocumentTable: string;
+  lanceDbMemoryTable: string;
+  lanceDbSessionTable: string;
+  lanceDbCapabilityTable: string;
+  memory: {
+    decayIntervalHours: number;
+    decayAmount: number;
+    deleteScoreThreshold: number;
+    deleteAfterDays: number;
+    hitBoost: number;
+    defaultScore: number;
+  };
+  evidenceContextWindow: number;
   defaultProjectId: string;
   wespy: {
     command: string;
@@ -76,6 +89,19 @@ export function loadConfig(): AppConfig {
     sqlitePath: readString("SQLITE_PATH", path.join(dataDir, "orchestrator.sqlite")),
     lanceDbUri: readString("LANCEDB_URI", path.join(dataDir, "lancedb")),
     lanceDbTable: readString("LANCEDB_TABLE", "document_chunks"),
+    lanceDbDocumentTable: readString("LANCEDB_DOCUMENT_TABLE", readString("LANCEDB_TABLE", "document_chunks")),
+    lanceDbMemoryTable: readString("LANCEDB_MEMORY_TABLE", "memory_items"),
+    lanceDbSessionTable: readString("LANCEDB_SESSION_TABLE", "session_summaries"),
+    lanceDbCapabilityTable: readString("LANCEDB_CAPABILITY_TABLE", "capability_index"),
+    memory: {
+      decayIntervalHours: readNumber("MEMORY_DECAY_INTERVAL_HOURS", 24),
+      decayAmount: readNumber("MEMORY_DECAY_AMOUNT", 1),
+      deleteScoreThreshold: readNumber("MEMORY_DELETE_SCORE_THRESHOLD", -5),
+      deleteAfterDays: readNumber("MEMORY_DELETE_AFTER_DAYS", 30),
+      hitBoost: readNumber("MEMORY_HIT_BOOST", 1),
+      defaultScore: readNumber("MEMORY_DEFAULT_SCORE", 5)
+    },
+    evidenceContextWindow: readNumber("EVIDENCE_CONTEXT_WINDOW", 1),
     defaultProjectId: readString("DEFAULT_PROJECT_ID", "default"),
     wespy: {
       command: readString("WESPY_COMMAND", "wespy"),
