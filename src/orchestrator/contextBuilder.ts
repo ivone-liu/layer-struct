@@ -57,6 +57,7 @@ export function summarizeSkillResults(skillResults: SkillExecutionResult[]): Arr
   skillId: string;
   status: SkillExecutionResult["status"];
   evidenceCount: number;
+  output?: Record<string, unknown>;
   error?: string;
 }> {
   return skillResults.map((result) => ({
@@ -64,8 +65,21 @@ export function summarizeSkillResults(skillResults: SkillExecutionResult[]): Arr
     skillId: result.skillId,
     status: result.status,
     evidenceCount: result.evidencePack?.items.length ?? 0,
+    output: summarizeOutput(result.output),
     error: result.error
   }));
+}
+
+function summarizeOutput(output: SkillExecutionResult["output"]): Record<string, unknown> | undefined {
+  if (!output) {
+    return undefined;
+  }
+  const text = typeof output.text === "string" ? truncate(output.text, 3000) : undefined;
+  return {
+    ...output,
+    text,
+    raw: undefined
+  };
 }
 
 export function defaultConstraints(answerStrategy: AnswerStrategy = "direct"): string[] {

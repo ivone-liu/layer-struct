@@ -26,7 +26,7 @@ export class WeChatArticleWorkflow {
     await mkdir(outputDir, { recursive: true });
 
     try {
-      await execFileAsync(this.config.command, [url, "--json", "-o", outputDir], {
+      await execFileAsync(this.config.command, [...this.config.commandArgs, url, "--json", "-o", outputDir], {
         timeout: this.config.timeoutMs,
         maxBuffer: 1024 * 1024 * 20
       });

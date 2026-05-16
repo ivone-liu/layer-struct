@@ -28,6 +28,31 @@ export class SkillPlanner {
     const semantic = /(核心观点|总结|提炼|类似观点|相似|语义|观点|详细展开)/iu.test(message);
     const requiresSavedData = Boolean(routePlan.requiresEvidence || routePlan.needsRag || routePlan.needsSkill || citation || mentionsCurrent || recentOrList);
 
+    const calls: SkillCall[] = [];
+    const addCall = (skillId: string, reason: string, params: Record<string, unknown>, required = true) => {
+      if (calls.some((call) => call.skillId === skillId && JSON.stringify(call.params) === JSON.stringify(params))) {
+        return;
+      }
+      calls.push({ id: randomUUID(), skillId, reason, params, required });
+    };
+
+    const mcpCapabilities = routePlan.candidateCapabilities.filter((capability) => capability.startsWith("mcp."));
+    if (mcpCapabilities.length > 0) {
+      for (const capability of mcpCapabilities) {
+        addCall(capability, "Router 选择了外部 MCP 工具。", {
+          query,
+          ...routePlan.extractedParams
+        });
+      }
+      return {
+        answerStrategy: routePlan.answerStrategy ?? "multi_step",
+        calls,
+        requiresEvidence: Boolean(routePlan.requiresEvidence),
+        canAnswerWithoutSkill: false,
+        rationale: "识别到请求应由已注册 MCP 工具处理。"
+      };
+    }
+
     if (!requiresSavedData) {
       return {
         answerStrategy: "direct",
@@ -37,14 +62,6 @@ export class SkillPlanner {
         rationale: "未识别到依赖已保存资料的需求，直接回答。"
       };
     }
-
-    const calls: SkillCall[] = [];
-    const addCall = (skillId: string, reason: string, params: Record<string, unknown>, required = true) => {
-      if (calls.some((call) => call.skillId === skillId && JSON.stringify(call.params) === JSON.stringify(params))) {
-        return;
-      }
-      calls.push({ id: randomUUID(), skillId, reason, params, required });
-    };
 
     const memoryDocumentId = memoryHits.find((hit) => hit.kind === "document_anchor" && hit.documentId)?.documentId;
     const resolvedDocumentId = documentResolution?.status === "resolved" ? documentResolution.documentId : memoryDocumentId;

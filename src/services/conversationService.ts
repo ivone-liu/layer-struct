@@ -24,6 +24,10 @@ export class ConversationService {
     return this.sqlite.archiveConversationSession(sessionId);
   }
 
+  updateSessionTitle(sessionId: string, title: string): ConversationSession | undefined {
+    return this.sqlite.updateConversationSession({ sessionId, title });
+  }
+
   ensureConversationSession(params: { sessionId?: string; userId?: string; projectId: string; firstMessage?: string }): ConversationSession {
     return this.sqlite.ensureConversationSession(params);
   }
@@ -47,6 +51,16 @@ export class ConversationService {
       metadata: params.metadata ?? {},
       createdAt: params.createdAt ?? new Date().toISOString()
     });
+  }
+
+  updateMessage(params: {
+    id: string;
+    content?: string;
+    contentType?: ConversationMessage["contentType"];
+    metadata?: Record<string, unknown>;
+    updatedAt?: string;
+  }): ConversationMessage | undefined {
+    return this.sqlite.updateConversationMessage(params);
   }
 
   getRecentMessages(sessionId: string, rawTurns = 2): ConversationMessage[] {

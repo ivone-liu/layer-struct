@@ -30,6 +30,7 @@ export interface AppConfig {
   defaultProjectId: string;
   wespy: {
     command: string;
+    commandArgs: string[];
     outputDir: string;
     timeoutMs: number;
   };
@@ -116,6 +117,7 @@ export function loadConfig(): AppConfig {
     defaultProjectId: readString("DEFAULT_PROJECT_ID", "default"),
     wespy: {
       command: readString("WESPY_COMMAND", "wespy"),
+      commandArgs: splitArgs(readString("WESPY_COMMAND_ARGS")),
       outputDir: readString("WESPY_OUTPUT_DIR", path.join(dataDir, "wespy")),
       timeoutMs: readNumber("WESPY_TIMEOUT_MS", 120000)
     },
@@ -134,4 +136,11 @@ export function loadConfig(): AppConfig {
       streamTotalTimeoutMs: readNumber("AI_STREAM_TOTAL_TIMEOUT_MS", 180000)
     }
   };
+}
+
+function splitArgs(value: string): string[] {
+  return value
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }

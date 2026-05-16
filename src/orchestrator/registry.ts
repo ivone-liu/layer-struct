@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { CapabilityDefinition } from "../types.js";
+import { loadMcpCapabilities } from "../mcp/registry.js";
 
 interface SkillRegistryEntry {
   name: string;
@@ -60,8 +61,9 @@ export const builtInCapabilities: CapabilityDefinition[] = [
 
 export function loadCapabilities(rootDir = process.cwd()): CapabilityDefinition[] {
   const skillCapabilities = loadSkillCapabilities(path.resolve(rootDir, "skills", "registry.json"));
+  const mcpCapabilities = loadMcpCapabilities(rootDir);
   const capabilitiesById = new Map<string, CapabilityDefinition>();
-  for (const capability of [...builtInCapabilities, ...skillCapabilities]) {
+  for (const capability of [...builtInCapabilities, ...skillCapabilities, ...mcpCapabilities]) {
     capabilitiesById.set(capability.id, capability);
   }
   return Array.from(capabilitiesById.values());

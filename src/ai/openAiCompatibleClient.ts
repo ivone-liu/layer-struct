@@ -126,7 +126,8 @@ export class OpenAiCompatibleClient {
       connectTimeout = abortAfter("connect", this.config.streamConnectTimeoutMs);
       totalTimeout = abortAfter("total", this.config.streamTotalTimeoutMs);
 
-      const response = await fetch(`${this.config.baseUrl}/chat/completions`, {
+      const requestUrl = `${this.config.baseUrl}/chat/completions`;
+      const response = await fetch(requestUrl, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -198,6 +199,9 @@ export class OpenAiCompatibleClient {
       if (isAbortError(error)) {
         throw new AiTimeoutError(abortPhase ?? "request", abortTimeoutMs || this.config.requestTimeoutMs);
       }
+      if (isFetchNetworkError(error)) {
+        throw new Error(`AI stream network request failed: POST ${this.config.baseUrl}/chat/completions: ${formatFetchError(error)}`);
+      }
       throw error;
     } finally {
       clearTimer(connectTimeout);
@@ -211,9 +215,10 @@ export class OpenAiCompatibleClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs);
     timeout.unref?.();
+    const requestUrl = `${this.config.baseUrl}${path}`;
 
     try {
-      const response = await fetch(`${this.config.baseUrl}${path}`, {
+      const response = await fetch(requestUrl, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -233,6 +238,9 @@ export class OpenAiCompatibleClient {
       if (isAbortError(error)) {
         throw new AiTimeoutError("request", this.config.requestTimeoutMs);
       }
+      if (isFetchNetworkError(error)) {
+        throw new Error(`AI request network error: POST ${requestUrl}: ${formatFetchError(error)}`);
+      }
       throw error;
     } finally {
       clearTimeout(timeout);
@@ -242,6 +250,31 @@ export class OpenAiCompatibleClient {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError" || error instanceof Error && error.name === "AbortError";
+}
+
+function isFetchNetworkError(error: unknown): boolean {
+  return error instanceof TypeError && error.message === "fetch failed";
+}
+
+function formatFetchError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  const cause = error.cause;
+  if (cause && typeof cause === "object") {
+    const details = cause as { code?: unknown; message?: unknown; hostname?: unknown; address?: unknown; port?: unknown };
+    const parts = [
+      typeof details.code === "string" ? details.code : undefined,
+      typeof details.message === "string" ? details.message : undefined,
+      typeof details.hostname === "string" ? `host=${details.hostname}` : undefined,
+      typeof details.address === "string" ? `address=${details.address}` : undefined,
+      typeof details.port === "number" || typeof details.port === "string" ? `port=${String(details.port)}` : undefined
+    ].filter(Boolean);
+    if (parts.length > 0) {
+      return parts.join("; ");
+    }
+  }
+  return error.message;
 }
 
 function parseStreamLine(line: string): string | undefined {

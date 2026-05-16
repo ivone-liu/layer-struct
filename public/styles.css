@@ -183,6 +183,10 @@ h2 {
   color: #243447;
 }
 
+.assistant .streaming-bubble {
+  color: #526377;
+}
+
 .user .bubble {
   background: #1f6feb;
   color: #ffffff;

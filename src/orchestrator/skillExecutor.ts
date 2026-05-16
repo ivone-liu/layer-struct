@@ -1,11 +1,19 @@
 import type { DocumentService } from "../services/documentService.js";
 import type { RequestContext, SkillCall, SkillExecutionResult } from "../types.js";
+import { McpClientManager } from "../mcp/clientManager.js";
 
 export class SkillExecutor {
-  constructor(private readonly documents: DocumentService) {}
+  constructor(
+    private readonly documents: DocumentService,
+    private readonly mcp = new McpClientManager()
+  ) {}
 
   async execute(call: SkillCall, context: RequestContext): Promise<SkillExecutionResult> {
     try {
+      if (call.skillId.startsWith("mcp.")) {
+        return this.mcp.callTool(call, context);
+      }
+
       if (call.skillId === "skill.lancedb_query") {
         const evidencePack = await this.documents.search({
           query: stringParam(call.params.query) || context.message,

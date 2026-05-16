@@ -2,7 +2,7 @@ import { parseJsonObject } from "../ai/json.js";
 import type { OpenAiCompatibleClient } from "../ai/openAiCompatibleClient.js";
 import { extractWeChatArticleUrl } from "../services/weChatArticleWorkflow.js";
 import type { RequestContext, RoutePlan } from "../types.js";
-import { capabilities } from "./registry.js";
+import { loadCapabilities } from "./registry.js";
 
 export class Router {
   constructor(
@@ -11,6 +11,7 @@ export class Router {
   ) {}
 
   async route(context: RequestContext): Promise<RoutePlan> {
+    const capabilities = loadCapabilities();
     if (this.ai.canChat(this.routerModel)) {
       try {
         return normalizeRoutePlan(
@@ -20,7 +21,7 @@ export class Router {
               jsonMode: true,
               temperature: 0,
               messages: [
-                { role: "system", content: routerSystemPrompt() },
+                { role: "system", content: routerSystemPrompt(capabilities) },
                 { role: "user", content: context.message }
               ]
             })
@@ -36,7 +37,7 @@ export class Router {
   }
 }
 
-function routerSystemPrompt(): string {
+function routerSystemPrompt(capabilities: ReturnType<typeof loadCapabilities>): string {
   return `你是 AI Orchestrator Router，只输出 JSON，不回答用户。
 
 任务类型只能是 chat、rag_chat、skill_call、workflow。
@@ -108,6 +109,30 @@ function routeByRules(message: string): RoutePlan {
         missingParams: writePayload.content ? [] : ["content"],
         confidence: 0.86,
         rationale: "规则识别到写入数据库意图。"
+      },
+      message
+    );
+  }
+
+  const explicitMcpCapability = extractExplicitMcpCapability(message);
+  if (explicitMcpCapability) {
+    return normalizeRoutePlan(
+      {
+        taskType: "skill_call",
+        needsRag: false,
+        needsMemory: false,
+        needsSkill: true,
+        needsWorkflow: false,
+        capabilityQuery: explicitMcpCapability,
+        searchQueries: [message],
+        candidateCapabilities: [explicitMcpCapability],
+        extractedParams: { query: message.replace(explicitMcpCapability, "").trim() || message },
+        missingParams: [],
+        confidence: 0.86,
+        rationale: "规则识别到用户显式指定 MCP capability。",
+        answerStrategy: "multi_step",
+        requiresEvidence: false,
+        resolvedQuery: message
       },
       message
     );
@@ -282,6 +307,10 @@ function selectQuerySkill(message: string): string {
     return "skill.sqlite_query";
   }
   return "skill.lancedb_query";
+}
+
+function extractExplicitMcpCapability(message: string): string | undefined {
+  return message.match(/\bmcp\.[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+\b/u)?.[0];
 }
 
 function clamp(value: number, min: number, max: number): number {

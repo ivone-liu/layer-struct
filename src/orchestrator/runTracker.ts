@@ -200,5 +200,8 @@ function isTimeoutLikeError(error: unknown): boolean {
 }
 
 function renderSkillStart(skillId: string): string {
+  if (skillId.startsWith("mcp.")) {
+    return `正在调用 MCP 工具 ${skillId}。`;
+  }
   return skillId === "skill.sqlite_query" ? "正在调用资料库精确查询。" : "正在调用资料库语义检索。";
 }

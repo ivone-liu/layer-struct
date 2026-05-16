@@ -1,5 +1,5 @@
 export type TaskType = "chat" | "rag_chat" | "skill_call" | "workflow";
-export type CapabilityKind = "skill" | "workflow";
+export type CapabilityKind = "skill" | "workflow" | "mcp_tool";
 export type RiskLevel = "low" | "medium" | "high";
 export type CostLevel = "low" | "medium" | "high";
 export type RunStatus = "running" | "completed" | "completed_with_fallback" | "failed";
@@ -143,6 +143,8 @@ export interface SkillExecutionResult {
   status: "success" | "failed" | "empty" | "skipped";
   evidencePack?: EvidencePack;
   output?: Record<string, unknown> & { collectedItemId?: string; documentId?: string; chunkCount?: number; memoryId?: string; };
+  resourceLinks?: Array<{ uri: string; title?: string; mimeType?: string }>;
+  structuredContent?: unknown;
   error?: string;
 }
 
@@ -269,6 +271,32 @@ export interface DocumentCandidate {
   reason: string;
 }
 
+export interface DocumentTag {
+  id: string;
+  projectId: string;
+  name: string;
+  description?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DocumentTagSuggestion {
+  name: string;
+  confidence: number;
+  reason?: string;
+}
+
+export interface DocumentTagAssignment {
+  documentId: string;
+  tagId: string;
+  name: string;
+  projectId: string;
+  confidence: number;
+  reason?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface DocumentResolution {
   status: "resolved" | "ambiguous" | "not_found";
   documentId?: string;
@@ -332,6 +360,8 @@ export interface ChatResponse {
 
 export type DocumentWriteProgressEvent =
   | { type: "document_created"; documentId: string; title: string; chunkCount: number }
+  | { type: "document_updated"; documentId: string; title: string; chunkCount: number }
+  | { type: "tags_generated"; documentId: string; tags: DocumentTagAssignment[] }
   | { type: "chunks_created"; documentId: string; chunkCount: number }
   | { type: "embedding_started"; documentId: string; chunkCount: number }
   | { type: "embedding_progress"; documentId: string; completed: number; total: number }
@@ -422,6 +452,17 @@ export interface StoredDocumentInput {
   source?: string;
   projectId: string;
   metadata?: Record<string, unknown>;
+  tags?: string[];
+}
+
+export interface StoredDocumentUpdateInput {
+  id: string;
+  title?: string;
+  content?: string;
+  source?: string | null;
+  projectId?: string;
+  metadata?: Record<string, unknown>;
+  tags?: string[];
 }
 
 export interface StoredDocument {
@@ -431,7 +472,9 @@ export interface StoredDocument {
   source?: string;
   projectId: string;
   metadata: Record<string, unknown>;
+  tags: string[];
   createdAt: string;
+  updatedAt: string;
 }
 
 export interface StoredChunk {

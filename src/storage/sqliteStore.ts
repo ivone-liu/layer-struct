@@ -9,6 +9,9 @@ import type {
   ConversationMessage,
   ConversationSession,
   ConversationSummary,
+  DocumentTag,
+  DocumentTagAssignment,
+  DocumentTagSuggestion,
   EvidenceItem,
   ExpandedEvidenceItem,
   MemoryHit,
@@ -21,6 +24,7 @@ import type {
   StoredChunk,
   StoredDocument,
   StoredDocumentInput,
+  StoredDocumentUpdateInput,
   SessionState
 } from "../types.js";
 
@@ -42,8 +46,8 @@ export class SqliteStore {
   insertDocument(document: StoredDocumentInput & { id: string; createdAt: string }): StoredDocument {
     this.db
       .prepare(
-        `INSERT INTO documents (id, title, source, project_id, content, metadata_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO documents (id, title, source, project_id, content, metadata_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         document.id,
@@ -52,6 +56,7 @@ export class SqliteStore {
         document.projectId,
         document.content,
         JSON.stringify(document.metadata ?? {}),
+        document.createdAt,
         document.createdAt
       );
 
@@ -62,8 +67,39 @@ export class SqliteStore {
       projectId: document.projectId,
       content: document.content,
       metadata: document.metadata ?? {},
-      createdAt: document.createdAt
+      tags: document.tags ?? tagsFromMetadata(document.metadata),
+      createdAt: document.createdAt,
+      updatedAt: document.createdAt
     };
+  }
+
+  updateDocument(input: StoredDocumentUpdateInput & { updatedAt: string }): StoredDocument | undefined {
+    const existing = this.getDocument(input.id);
+    if (!existing) return undefined;
+
+    const nextMetadata = input.metadata ? { ...existing.metadata, ...input.metadata } : existing.metadata;
+    this.db
+      .prepare(
+        `UPDATE documents
+         SET title = COALESCE(?, title),
+             source = ?,
+             project_id = COALESCE(?, project_id),
+             content = COALESCE(?, content),
+             metadata_json = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        input.title ?? null,
+        input.source === undefined ? existing.source ?? null : input.source,
+        input.projectId ?? null,
+        input.content ?? null,
+        JSON.stringify(nextMetadata),
+        input.updatedAt,
+        input.id
+      );
+
+    return this.getDocument(input.id);
   }
 
   insertChunk(chunk: StoredChunk): void {
@@ -75,9 +111,16 @@ export class SqliteStore {
       .run(chunk.id, chunk.documentId, chunk.chunkIndex, chunk.content, estimateTokens(chunk.content), chunk.createdAt);
   }
 
+  replaceDocumentChunks(documentId: string, chunks: StoredChunk[]): void {
+    this.db.prepare("DELETE FROM chunks WHERE document_id = ?").run(documentId);
+    for (const chunk of chunks) {
+      this.insertChunk(chunk);
+    }
+  }
+
   getDocument(documentId: string): StoredDocument | undefined {
     const row = this.db.prepare("SELECT * FROM documents WHERE id = ?").get(documentId) as DocumentRow | undefined;
-    return row ? mapDocument(row) : undefined;
+    return row ? this.hydrateDocument(row) : undefined;
   }
 
   getChunk(chunkId: string): (StoredChunk & { title: string; source?: string; projectId: string }) | undefined {
@@ -110,7 +153,148 @@ export class SqliteStore {
     const rows = this.db
       .prepare("SELECT * FROM documents ORDER BY created_at DESC LIMIT ?")
       .all(limit) as unknown as DocumentRow[];
-    return rows.map(mapDocument);
+    return rows.map((row) => this.hydrateDocument(row));
+  }
+
+  createTag(params: { projectId: string; name: string; description?: string; now?: string }): DocumentTag {
+    const now = params.now ?? new Date().toISOString();
+    const name = normalizeTagName(params.name);
+    const normalizedName = normalizeTagKey(name);
+    const existing = this.getTagByName(params.projectId, name);
+    if (existing) {
+      return existing;
+    }
+
+    const tag: DocumentTag = {
+      id: cryptoRandomId(),
+      projectId: params.projectId,
+      name,
+      description: params.description,
+      createdAt: now,
+      updatedAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO document_tags (id, project_id, name, normalized_name, description, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(tag.id, tag.projectId, tag.name, normalizedName, tag.description ?? null, tag.createdAt, tag.updatedAt);
+    return tag;
+  }
+
+  updateTag(params: { id: string; name?: string; description?: string | null }): DocumentTag | undefined {
+    const existing = this.getTag(params.id);
+    if (!existing) return undefined;
+    const nextName = params.name ? normalizeTagName(params.name) : existing.name;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE document_tags
+         SET name = ?, normalized_name = ?, description = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(nextName, normalizeTagKey(nextName), params.description === undefined ? existing.description ?? null : params.description, now, params.id);
+    return this.getTag(params.id);
+  }
+
+  deleteTag(id: string): boolean {
+    const result = this.db.prepare("DELETE FROM document_tags WHERE id = ?").run(id);
+    return Number(result.changes) > 0;
+  }
+
+  getTag(id: string): DocumentTag | undefined {
+    const row = this.db.prepare("SELECT * FROM document_tags WHERE id = ?").get(id) as DocumentTagRow | undefined;
+    return row ? mapDocumentTag(row) : undefined;
+  }
+
+  getTagByName(projectId: string, name: string): DocumentTag | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM document_tags WHERE project_id = ? AND normalized_name = ?")
+      .get(projectId, normalizeTagKey(name)) as DocumentTagRow | undefined;
+    return row ? mapDocumentTag(row) : undefined;
+  }
+
+  listTags(params: { projectId: string; query?: string; limit?: number; offset?: number }): DocumentTag[] {
+    const limit = params.limit ?? 100;
+    const offset = params.offset ?? 0;
+    if (params.query?.trim()) {
+      const pattern = `%${escapeLike(params.query.trim())}%`;
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM document_tags
+           WHERE project_id = ? AND (name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\')
+           ORDER BY updated_at DESC, name ASC
+           LIMIT ? OFFSET ?`
+        )
+        .all(params.projectId, pattern, pattern, limit, offset) as unknown as DocumentTagRow[];
+      return rows.map(mapDocumentTag);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM document_tags
+         WHERE project_id = ?
+         ORDER BY updated_at DESC, name ASC
+         LIMIT ? OFFSET ?`
+      )
+      .all(params.projectId, limit, offset) as unknown as DocumentTagRow[];
+    return rows.map(mapDocumentTag);
+  }
+
+  replaceDocumentTags(documentId: string, projectId: string, suggestions: DocumentTagSuggestion[]): DocumentTagAssignment[] {
+    const now = new Date().toISOString();
+    const existing = this.getDocument(documentId);
+    if (!existing) return [];
+    const deduped = dedupeTagSuggestions(suggestions);
+    this.db.prepare("DELETE FROM document_tag_links WHERE document_id = ?").run(documentId);
+
+    const assignments: DocumentTagAssignment[] = [];
+    for (const suggestion of deduped) {
+      const tag = this.createTag({ projectId, name: suggestion.name, now });
+      this.db
+        .prepare(
+          `INSERT INTO document_tag_links (document_id, tag_id, confidence, reason, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(document_id, tag_id) DO UPDATE SET
+             confidence = excluded.confidence,
+             reason = excluded.reason,
+             updated_at = excluded.updated_at`
+        )
+        .run(documentId, tag.id, clampConfidence(suggestion.confidence), suggestion.reason ?? null, now, now);
+      assignments.push({
+        documentId,
+        tagId: tag.id,
+        name: tag.name,
+        projectId: tag.projectId,
+        confidence: clampConfidence(suggestion.confidence),
+        reason: suggestion.reason,
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+
+    const metadata = { ...existing.metadata, tags: assignments.map((tag) => tag.name), tagAssignments: assignments };
+    this.db.prepare("UPDATE documents SET metadata_json = ?, updated_at = ? WHERE id = ?").run(JSON.stringify(metadata), now, documentId);
+    return assignments;
+  }
+
+  getDocumentTags(documentId: string): DocumentTagAssignment[] {
+    const rows = this.db
+      .prepare(
+        `SELECT l.document_id, l.tag_id, l.confidence, l.reason, l.created_at, l.updated_at,
+                t.project_id, t.name
+         FROM document_tag_links l
+         JOIN document_tags t ON t.id = l.tag_id
+         WHERE l.document_id = ?
+         ORDER BY l.confidence DESC, t.name ASC`
+      )
+      .all(documentId) as unknown as DocumentTagLinkJoinRow[];
+    return rows.map(mapDocumentTagAssignment);
+  }
+
+  private hydrateDocument(row: DocumentRow): StoredDocument {
+    const document = mapDocument(row);
+    const tags = this.getDocumentTags(document.id).map((tag) => tag.name);
+    return { ...document, tags: tags.length > 0 ? tags : document.tags };
   }
 
 
@@ -128,11 +312,23 @@ export class SqliteStore {
       .prepare(
         `SELECT * FROM documents
          WHERE project_id = ?
-           AND (title LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')
+           AND (
+             title LIKE ? ESCAPE '\\'
+             OR source LIKE ? ESCAPE '\\'
+             OR content LIKE ? ESCAPE '\\'
+             OR metadata_json LIKE ? ESCAPE '\\'
+             OR EXISTS (
+               SELECT 1
+               FROM document_tag_links dtl
+               JOIN document_tags dt ON dt.id = dtl.tag_id
+               WHERE dtl.document_id = documents.id
+                 AND dt.name LIKE ? ESCAPE '\\'
+             )
+           )
          ORDER BY created_at DESC
          LIMIT ?`
       )
-      .all(params.projectId, pattern, pattern, pattern, limit) as unknown as DocumentRow[];
+      .all(params.projectId, pattern, pattern, pattern, pattern, pattern, limit) as unknown as DocumentRow[];
     return rows.map((row) => ({
       documentId: row.id,
       title: row.title,
@@ -192,11 +388,23 @@ export class SqliteStore {
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
          WHERE d.project_id = ?
-           AND (d.title LIKE ? ESCAPE '\\' OR d.source LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\')
+           AND (
+             d.title LIKE ? ESCAPE '\\'
+             OR d.source LIKE ? ESCAPE '\\'
+             OR c.content LIKE ? ESCAPE '\\'
+             OR d.metadata_json LIKE ? ESCAPE '\\'
+             OR EXISTS (
+               SELECT 1
+               FROM document_tag_links dtl
+               JOIN document_tags dt ON dt.id = dtl.tag_id
+               WHERE dtl.document_id = d.id
+                 AND dt.name LIKE ? ESCAPE '\\'
+             )
+           )
          ORDER BY d.created_at DESC, c.chunk_index ASC
          LIMIT ?`
       )
-      .all(params.projectId, pattern, pattern, pattern, limit) as unknown as ChunkJoinRow[];
+      .all(params.projectId, pattern, pattern, pattern, pattern, pattern, limit) as unknown as ChunkJoinRow[];
 
     return rows.map((row) => mapChunkEvidence(row, keywordScore(row, terms)));
   }
@@ -218,11 +426,23 @@ export class SqliteStore {
          FROM chunks c
          JOIN documents d ON d.id = c.document_id
          WHERE c.document_id = ?
-           AND (d.title LIKE ? ESCAPE '\\' OR d.source LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\')
+           AND (
+             d.title LIKE ? ESCAPE '\\'
+             OR d.source LIKE ? ESCAPE '\\'
+             OR c.content LIKE ? ESCAPE '\\'
+             OR d.metadata_json LIKE ? ESCAPE '\\'
+             OR EXISTS (
+               SELECT 1
+               FROM document_tag_links dtl
+               JOIN document_tags dt ON dt.id = dtl.tag_id
+               WHERE dtl.document_id = d.id
+                 AND dt.name LIKE ? ESCAPE '\\'
+             )
+           )
          ORDER BY c.chunk_index ASC
          LIMIT ?`
       )
-      .all(params.documentId, pattern, pattern, pattern, limit) as unknown as ChunkJoinRow[];
+      .all(params.documentId, pattern, pattern, pattern, pattern, pattern, limit) as unknown as ChunkJoinRow[];
 
     return rows.map((row) => mapChunkEvidence(row, keywordScore(row, terms)));
   }
@@ -519,6 +739,45 @@ export class SqliteStore {
     return message;
   }
 
+  updateConversationMessage(params: {
+    id: string;
+    content?: string;
+    contentType?: ConversationMessage["contentType"];
+    metadata?: Record<string, unknown>;
+    updatedAt?: string;
+  }): ConversationMessage | undefined {
+    const existingRow = this.db.prepare("SELECT * FROM conversation_messages WHERE id = ?").get(params.id) as ConversationMessageRow | undefined;
+    if (!existingRow) return undefined;
+
+    const existing = mapConversationMessage(existingRow);
+    const nextContent = params.content ?? existing.content;
+    const nextMetadata = params.metadata ? { ...existing.metadata, ...params.metadata } : existing.metadata;
+    this.db
+      .prepare(
+        `UPDATE conversation_messages
+         SET content = ?,
+             content_type = COALESCE(?, content_type),
+             metadata_json = ?,
+             token_estimate = ?
+         WHERE id = ?`
+      )
+      .run(nextContent, params.contentType ?? null, JSON.stringify(nextMetadata), estimateTokens(nextContent), params.id);
+
+    const updated = this.getConversationMessage(params.id);
+    if (updated) {
+      this.updateConversationAfterMessage(updated.sessionId, {
+        content: updated.content,
+        createdAt: params.updatedAt ?? new Date().toISOString()
+      });
+    }
+    return updated;
+  }
+
+  getConversationMessage(messageId: string): ConversationMessage | undefined {
+    const row = this.db.prepare("SELECT * FROM conversation_messages WHERE id = ?").get(messageId) as ConversationMessageRow | undefined;
+    return row ? mapConversationMessage(row) : undefined;
+  }
+
   listSessionMessages(sessionId: string, limit = 12): ConversationMessage[] {
     return this.listConversationMessages({ sessionId, limit });
   }
@@ -804,7 +1063,8 @@ export class SqliteStore {
         project_id TEXT NOT NULL,
         content TEXT NOT NULL,
         metadata_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS chunks (
@@ -819,6 +1079,33 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS idx_documents_project ON documents(project_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, chunk_index);
+
+      CREATE TABLE IF NOT EXISTS document_tags (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        normalized_name TEXT NOT NULL,
+        description TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(project_id, normalized_name)
+      );
+
+      CREATE TABLE IF NOT EXISTS document_tag_links (
+        document_id TEXT NOT NULL,
+        tag_id TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (document_id, tag_id),
+        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+        FOREIGN KEY (tag_id) REFERENCES document_tags(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_document_tags_project_name ON document_tags(project_id, normalized_name);
+      CREATE INDEX IF NOT EXISTS idx_document_tag_links_document ON document_tag_links(document_id);
+      CREATE INDEX IF NOT EXISTS idx_document_tag_links_tag ON document_tag_links(tag_id);
 
       CREATE TABLE IF NOT EXISTS conversation_sessions (
         id TEXT PRIMARY KEY,
@@ -974,6 +1261,8 @@ export class SqliteStore {
     this.addColumnIfMissing("conversation_messages", "content_type", "TEXT DEFAULT 'text'");
     this.addColumnIfMissing("conversation_messages", "metadata_json", "TEXT DEFAULT '{}'");
     this.addColumnIfMissing("conversation_messages", "token_estimate", "INTEGER DEFAULT 0");
+    this.addColumnIfMissing("documents", "updated_at", "TEXT");
+    this.db.exec("UPDATE documents SET updated_at = created_at WHERE updated_at IS NULL;");
     this.backfillConversationSessions();
   }
 
@@ -1080,6 +1369,27 @@ interface DocumentRow {
   content: string;
   metadata_json: string;
   created_at: string;
+  updated_at: string | null;
+}
+
+interface DocumentTagRow {
+  id: string;
+  project_id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface DocumentTagLinkJoinRow {
+  document_id: string;
+  tag_id: string;
+  name: string;
+  project_id: string;
+  confidence: number;
+  reason: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface SessionStateRow {
@@ -1264,14 +1574,41 @@ function mapSessionState(row: SessionStateRow): SessionState {
 }
 
 function mapDocument(row: DocumentRow): StoredDocument {
+  const metadata = safeParseRecord(row.metadata_json);
   return {
     id: row.id,
     title: row.title,
     source: row.source ?? undefined,
     projectId: row.project_id,
     content: row.content,
-    metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
-    createdAt: row.created_at
+    metadata,
+    tags: tagsFromMetadata(metadata),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at ?? row.created_at
+  };
+}
+
+function mapDocumentTag(row: DocumentTagRow): DocumentTag {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    description: row.description ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapDocumentTagAssignment(row: DocumentTagLinkJoinRow): DocumentTagAssignment {
+  return {
+    documentId: row.document_id,
+    tagId: row.tag_id,
+    name: row.name,
+    projectId: row.project_id,
+    confidence: row.confidence,
+    reason: row.reason ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
   };
 }
 
@@ -1361,8 +1698,41 @@ function keywordScoreMemory(row: MemoryRow, terms: string[]): number {
 }
 
 function documentKeywordScore(row: DocumentRow, terms: string[]): number {
-  const haystack = `${row.title} ${row.source ?? ""} ${row.content}`.toLowerCase();
+  const haystack = `${row.title} ${row.source ?? ""} ${row.content} ${row.metadata_json}`.toLowerCase();
   return terms.reduce((score, term) => score + (haystack.includes(term.toLowerCase()) ? 1 : 0), 0);
+}
+
+function normalizeTagName(name: string): string {
+  return name.replace(/\s+/g, " ").trim().replace(/^#/, "").slice(0, 40);
+}
+
+function normalizeTagKey(name: string): string {
+  return normalizeTagName(name).toLowerCase();
+}
+
+function dedupeTagSuggestions(suggestions: DocumentTagSuggestion[]): DocumentTagSuggestion[] {
+  const byKey = new Map<string, DocumentTagSuggestion>();
+  for (const suggestion of suggestions) {
+    const name = normalizeTagName(suggestion.name);
+    if (!name) continue;
+    const key = normalizeTagKey(name);
+    const normalized = { ...suggestion, name, confidence: clampConfidence(suggestion.confidence) };
+    const existing = byKey.get(key);
+    if (!existing || normalized.confidence > existing.confidence) {
+      byKey.set(key, normalized);
+    }
+  }
+  return [...byKey.values()].sort((a, b) => b.confidence - a.confidence).slice(0, 12);
+}
+
+function clampConfidence(value: number): number {
+  if (!Number.isFinite(value)) return 0.65;
+  return Math.min(1, Math.max(0, value));
+}
+
+function tagsFromMetadata(metadata?: Record<string, unknown>): string[] {
+  const value = metadata?.tags;
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function safeParseStringArray(value: string | null): string[] {

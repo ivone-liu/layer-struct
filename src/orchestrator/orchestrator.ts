@@ -23,11 +23,11 @@ import { buildFinalPrompt, defaultConstraints } from "./contextBuilder.js";
 import { extractWritePayload, Router } from "./router.js";
 import { DocumentService } from "../services/documentService.js";
 import { extractWeChatArticleUrl, WeChatArticleWorkflow } from "../services/weChatArticleWorkflow.js";
-import { RunTracker } from "./runTracker.js";
+import { formatUserFacingError, RunTracker } from "./runTracker.js";
 import { SkillPlanner } from "./skillPlanner.js";
 import { SkillExecutor } from "./skillExecutor.js";
 import { observeSkillResults } from "./skillObserver.js";
-import { capabilities } from "./registry.js";
+import { loadCapabilities } from "./registry.js";
 import { MemoryService } from "../services/memoryService.js";
 import { ConversationService } from "../services/conversationService.js";
 import { ContextCompressor } from "../services/contextCompressor.js";
@@ -66,6 +66,7 @@ export class Orchestrator {
   async chat(input: { message: string; sessionId?: string; userId?: string; projectId?: string }): Promise<ChatResponse> {
     const context = createRequestContext(input, this.config.defaultProjectId);
     const conversation = this.conversationService.ensureConversationSession({ sessionId: input.sessionId, userId: input.userId, projectId: context.projectId, firstMessage: input.message });
+    const shouldGenerateTitle = shouldGenerateConversationTitle(conversation, input.message);
     context.sessionId = conversation.id;
     this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
 
@@ -79,9 +80,10 @@ export class Orchestrator {
     if (documentResolution.status === "ambiguous") {
       const answer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
       this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer });
+      await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer, enabled: shouldGenerateTitle });
       return { answer, routePlan, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation };
     }
-    const skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities, documentResolution, memoryHits);
+    const skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, loadCapabilities(), documentResolution, memoryHits);
     routePlan.skillPlan = skillPlan;
     routePlan.answerStrategy = skillPlan.answerStrategy;
     routePlan.requiresEvidence = skillPlan.requiresEvidence;
@@ -95,6 +97,7 @@ export class Orchestrator {
     const conversationContext = generation?.conversationContext;
 
     this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer, contentType: executionResult ? "workflow_result" : "markdown" });
+    await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer, enabled: shouldGenerateTitle });
     return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation, conversationContext };
   }
 
@@ -104,6 +107,7 @@ export class Orchestrator {
   ): Promise<ChatResponse> {
     const context = createRequestContext(input, this.config.defaultProjectId);
     const conversation = this.conversationService.ensureConversationSession({ sessionId: input.sessionId, userId: input.userId, projectId: context.projectId, firstMessage: input.message });
+    const shouldGenerateTitle = shouldGenerateConversationTitle(conversation, input.message);
     context.sessionId = conversation.id;
     this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
 
@@ -129,6 +133,38 @@ export class Orchestrator {
     let memoryHits: MemoryHit[] = [];
     let completedWithFallback = false;
     let conversationContext: ConversationContextPack | undefined;
+    let assistantMessageId: string | undefined;
+
+    const ensureAssistantMessage = (contentType: "markdown" | "workflow_result" | "error" = "markdown"): string => {
+      if (assistantMessageId) {
+        return assistantMessageId;
+      }
+      const message = this.conversationService.appendMessage({
+        sessionId: context.sessionId,
+        runId,
+        role: "assistant",
+        content: "",
+        contentType,
+        metadata: { status: "streaming", runId }
+      });
+      assistantMessageId = message.id;
+      return assistantMessageId;
+    };
+
+    const persistAssistantMessage = (
+      content: string,
+      status: "streaming" | "completed" | "completed_with_fallback" | "failed",
+      contentType: "markdown" | "workflow_result" | "error" = "markdown",
+      metadata: Record<string, unknown> = {}
+    ): void => {
+      const messageId = ensureAssistantMessage(contentType);
+      this.conversationService.updateMessage({
+        id: messageId,
+        content,
+        contentType,
+        metadata: { status, runId, ...metadata }
+      });
+    };
 
     try {
       callbacks.onEvent({ type: "conversation_created", runId, visibleMessage: "对话会话已就绪。", conversation });
@@ -153,8 +189,9 @@ export class Orchestrator {
       if (documentResolution.status === "ambiguous") {
         callbacks.onEvent({ type: "document_ambiguous", runId, visibleMessage: "找到多篇候选文档，需要选择。", documentResolution });
         finalAnswer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
+        persistAssistantMessage(finalAnswer, "completed");
         await tracker.answerDelta(finalAnswer);
-        this.conversationService.appendMessage({ sessionId: context.sessionId, runId, role: "assistant", content: finalAnswer });
+        await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer: finalAnswer, enabled: shouldGenerateTitle });
         const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
         callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
         const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext };
@@ -164,7 +201,7 @@ export class Orchestrator {
       if (documentResolution.status === "resolved") {
         callbacks.onEvent({ type: "document_resolved", runId, visibleMessage: `已定位到《${documentResolution.title ?? documentResolution.documentId}》。`, documentResolution });
       }
-      skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, capabilities, documentResolution, memoryHits);
+      skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, loadCapabilities(), documentResolution, memoryHits);
       routePlan.skillPlan = skillPlan;
       routePlan.answerStrategy = skillPlan.answerStrategy;
       routePlan.requiresEvidence = skillPlan.requiresEvidence;
@@ -178,6 +215,7 @@ export class Orchestrator {
       if (guardAnswer) {
         finalAnswer = guardAnswer;
         await tracker.observation(observation, "没有找到足够证据，停止生成。");
+        persistAssistantMessage(finalAnswer, "completed");
         await tracker.answerDelta(finalAnswer);
       } else {
         await tracker.observation(observation, "证据足够，开始生成回答。");
@@ -199,6 +237,7 @@ export class Orchestrator {
         try {
           for await (const chunk of this.generateAnswerStreamFromPrepared(generationInput)) {
             finalAnswer += chunk;
+            persistAssistantMessage(finalAnswer, "streaming", executionResult ? "workflow_result" : "markdown");
             await tracker.answerDelta(chunk);
           }
           await tracker.stepCompleted("generation", "回答生成完成。", { answerLength: finalAnswer.length });
@@ -209,6 +248,9 @@ export class Orchestrator {
           usedFallback = true;
           completedWithFallback = true;
           finalAnswer = renderGenerationFallback(error, evidencePack);
+          persistAssistantMessage(finalAnswer, "completed_with_fallback", executionResult ? "workflow_result" : "markdown", {
+            fallback: true
+          });
           await tracker.answerDelta(finalAnswer);
           await tracker.stepCompleted("generation", "生成模型超时，已返回降级结果。", {
             fallback: true,
@@ -221,13 +263,17 @@ export class Orchestrator {
         }
       }
 
-      this.conversationService.appendMessage({ sessionId: context.sessionId, runId, role: "assistant", content: finalAnswer, contentType: executionResult ? "workflow_result" : "markdown" });
+      persistAssistantMessage(finalAnswer, completedWithFallback ? "completed_with_fallback" : "completed", executionResult ? "workflow_result" : "markdown");
+      await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer: finalAnswer, enabled: shouldGenerateTitle });
       const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
       callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
       const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext };
       await tracker.done(result, completedWithFallback ? "completed_with_fallback" : "completed");
       return result;
     } catch (error) {
+      persistAssistantMessage(finalAnswer || formatUserFacingError(error), "failed", "error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
       await tracker.error(error);
       throw error;
     }
@@ -246,7 +292,7 @@ export class Orchestrator {
       status: "success",
       capabilityId: "workflow.ingest_text_database",
       message: "文档已写入 SQLite、LanceDB，并创建 document_anchor memory。",
-      output: { documentId: result.document.id, title: result.document.title, chunkCount: result.chunkCount }
+      output: { documentId: result.document.id, title: result.document.title, tags: result.document.tags, chunkCount: result.chunkCount }
     };
   }
 
@@ -400,7 +446,7 @@ export class Orchestrator {
       status: "success",
       capabilityId,
       message: "文档已写入 SQLite 与 LanceDB。",
-      output: { documentId: result.document.id, title: result.document.title, chunkCount: result.chunkCount }
+      output: { documentId: result.document.id, title: result.document.title, tags: result.document.tags, chunkCount: result.chunkCount }
     };
   }
 
@@ -474,10 +520,56 @@ export class Orchestrator {
     }
   }
 
+  private async updateConversationTitleAfterFirstTurn(params: {
+    sessionId: string;
+    question: string;
+    answer: string;
+    enabled: boolean;
+  }): Promise<void> {
+    if (!params.enabled) {
+      return;
+    }
+
+    const title = await this.generateConversationTitle(params.question, params.answer);
+    if (!title) {
+      return;
+    }
+    this.conversationService.updateSessionTitle(params.sessionId, title);
+  }
+
+  private async generateConversationTitle(question: string, answer: string): Promise<string | undefined> {
+    const model = this.config.ai.compressorModel || this.config.ai.routerModel || this.config.ai.chatModel;
+    if (!this.ai.canChat(model)) {
+      return undefined;
+    }
+
+    try {
+      const raw = await this.ai.chat({
+        model,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "system",
+            content:
+              "你是对话标题生成器。根据用户第一轮问题和助手回答，推理出一个中文对话主题标题。只输出标题本身，不要解释，不要加引号。标题要具体、短、可读，8 到 18 个汉字优先。"
+          },
+          {
+            role: "user",
+            content: `用户问题：\n${question.slice(0, 1200)}\n\n助手回答：\n${answer.slice(0, 2400)}`
+          }
+        ]
+      });
+      return normalizeGeneratedTitle(raw);
+    } catch {
+      return undefined;
+    }
+  }
+
   private renderWorkflowAnswer(executionResult: ExecutionResult): string {
     if (executionResult.status === "success") {
       const title = executionResult.output?.title ? `，标题：${String(executionResult.output.title)}` : "";
-      return `已写入数据库${title}。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(executionResult.output?.chunkCount)}。`;
+      const tags = Array.isArray(executionResult.output?.tags) && executionResult.output.tags.length > 0 ? `，标签：${executionResult.output.tags.map(String).join("、")}` : "";
+      return `已写入数据库${title}${tags}。文档 ID：${String(executionResult.output?.documentId)}，切片数：${String(executionResult.output?.chunkCount)}。`;
     }
     return `写入数据库失败：${executionResult.error ?? executionResult.message}`;
   }
@@ -525,6 +617,35 @@ function buildFinalMessages(prompt: string) {
 
 function createRequestContext(input: { message: string; sessionId?: string; userId?: string; projectId?: string }, defaultProjectId: string): RequestContext {
   return { requestId: randomUUID(), sessionId: input.sessionId || randomUUID(), userId: input.userId, projectId: input.projectId || defaultProjectId, message: input.message, createdAt: new Date().toISOString() };
+}
+
+function shouldGenerateConversationTitle(conversation: ConversationSession, firstMessage: string): boolean {
+  if (conversation.messageCount !== 0) {
+    return false;
+  }
+  const title = conversation.title.trim();
+  return /^新对话$|^未命名对话$/.test(title) || title === firstMessage.replace(/\s+/g, " ").trim().slice(0, 30);
+}
+
+function normalizeGeneratedTitle(value: string): string | undefined {
+  const firstLine = value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  if (!firstLine) {
+    return undefined;
+  }
+
+  const title = firstLine
+    .replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, "")
+    .replace(/^标题[:：]\s*/u, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[。.!！?？]+$/u, "");
+  if (!title || title.length < 2) {
+    return undefined;
+  }
+  return title.slice(0, 30);
 }
 
 function stringParam(value: unknown): string | undefined {
@@ -585,6 +706,8 @@ function trackerRunId(tracker?: RunTracker): string {
 function documentProgressMessage(event: DocumentWriteProgressEvent): string {
   switch (event.type) {
     case "document_created": return "文档记录已创建。";
+    case "document_updated": return "文档记录已更新。";
+    case "tags_generated": return event.tags.length > 0 ? `已生成标签：${event.tags.map((tag) => tag.name).join("、")}。` : "未生成有效标签。";
     case "chunks_created": return `已完成切片，共 ${event.chunkCount} 段。`;
     case "embedding_started": return "正在生成向量表示。";
     case "embedding_progress": return `向量生成进度：${event.completed}/${event.total}。`;

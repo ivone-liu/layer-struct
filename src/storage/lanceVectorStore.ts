@@ -6,6 +6,7 @@ export type LanceTableName = "document_chunks" | "memory_items" | "session_summa
 type LanceRecord = Record<string, unknown> & { vector: number[] };
 
 interface LanceTable {
+  delete?(predicate: string): Promise<void>;
   add(records: LanceRecord[]): Promise<void>;
   vectorSearch(vector: number[]): {
     limit(limit: number): { toArray(): Promise<Array<Record<string, unknown>>> };
@@ -38,6 +39,15 @@ export class LanceVectorStore {
 
   async addChunks(records: Array<LanceRecord & { chunkId: string; documentId: string; projectId: string; title: string; text: string; chunkIndex: number }>): Promise<void> {
     await this.addRecords(this.defaultTableName, records);
+  }
+
+  async deleteDocumentChunks(documentId: string): Promise<void> {
+    const db = await this.connect();
+    const table = await this.openTable(db, this.defaultTableName);
+    if (!table?.delete) {
+      return;
+    }
+    await table.delete(`documentId = '${escapeLanceString(documentId)}'`);
   }
 
   async search(params: { vector: number[]; projectId: string; limit?: number }): Promise<EvidenceItem[]>;
@@ -127,4 +137,8 @@ function optionalString(value: unknown): string | undefined {
 function parseOptionalNumber(value: unknown): number | undefined {
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function escapeLanceString(value: string): string {
+  return value.replace(/'/g, "''");
 }

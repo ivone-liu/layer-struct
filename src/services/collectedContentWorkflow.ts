@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { DocumentService } from "./documentService.js";
+import { DocumentWriteFailure, type DocumentService } from "./documentService.js";
 import type { MemoryService } from "./memoryService.js";
 import type { SqliteStore } from "../storage/sqliteStore.js";
 import type { CollectedItem, CollectedItemKind, DocumentWriteProgressEvent, ExecutionResult } from "../types.js";
@@ -77,18 +77,33 @@ export class CollectedContentWorkflow {
           memoryId: memory.id,
           title: result.document.title,
           source: result.document.source,
+          tags: result.document.tags,
           chunkCount: result.chunkCount,
           memoryCreated: true
         }
       };
     } catch (error) {
-      const failed = this.sqlite.updateCollectedItem({ id: item.id, status: "failed", metadata: { error: error instanceof Error ? error.message : String(error) } }) ?? item;
+      const partialDocument = error instanceof DocumentWriteFailure ? {
+        documentId: error.documentId,
+        title: error.title,
+        chunkCount: error.chunkCount,
+        failedPhase: error.phase
+      } : undefined;
+      const failed = this.sqlite.updateCollectedItem({
+        id: item.id,
+        status: "failed",
+        documentId: partialDocument?.documentId,
+        metadata: {
+          error: error instanceof Error ? error.message : String(error),
+          partialDocument
+        }
+      }) ?? item;
       await params.onProgress?.({ type: "collected_item_failed", item: failed });
       return {
         status: "failed",
         capabilityId: "workflow.ingest_collected_content",
         message: "采集内容入库失败。",
-        output: { collectedItemId: item.id },
+        output: { collectedItemId: item.id, documentId: partialDocument?.documentId, chunkCount: partialDocument?.chunkCount },
         error: error instanceof Error ? error.message : String(error)
       };
     }
