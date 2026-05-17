@@ -40,6 +40,7 @@ export interface AppConfig {
     routerModel: string;
     chatModel: string;
     compressorModel: string;
+    requirementMemoryModel: string;
     embeddingModel: string;
     embeddingDim: number;
     requestTimeoutMs: number;
@@ -127,6 +128,7 @@ export function loadConfig(): AppConfig {
       routerModel: readString("AI_ROUTER_MODEL"),
       chatModel: readString("AI_CHAT_MODEL"),
       compressorModel: readString("AI_COMPRESSOR_MODEL", readString("AI_ROUTER_MODEL", readString("AI_CHAT_MODEL"))),
+      requirementMemoryModel: readString("AI_REQUIREMENT_MEMORY_MODEL", readString("AI_COMPRESSOR_MODEL", readString("AI_ROUTER_MODEL", readString("AI_CHAT_MODEL")))),
       embeddingModel: readString("AI_EMBEDDING_MODEL"),
       embeddingDim: readNumber("AI_EMBEDDING_DIM", 1536),
       requestTimeoutMs: readNumber("AI_REQUEST_TIMEOUT_MS", 60000),

@@ -73,6 +73,23 @@ export interface ConversationSummary {
   updatedAt: string;
 }
 
+export interface SessionRequirementMemory {
+  id: string;
+  sessionId: string;
+  projectId: string;
+  userId?: string;
+  coreQuestion: string;
+  currentUnderstanding: string;
+  details: string[];
+  openQuestions: string[];
+  firstUserMessageId?: string;
+  lastUserMessageId?: string;
+  lastAssistantMessageId?: string;
+  model: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ConversationContextPack {
   compressedContext?: ConversationCompressedContext;
   compressedText?: string;
@@ -343,6 +360,7 @@ export interface FinalContext {
   constraints: string[];
   memoryHits?: MemoryHit[];
   conversationContext?: ConversationContextPack;
+  sessionRequirementMemory?: SessionRequirementMemory;
 }
 
 export interface ChatResponse {
@@ -356,6 +374,7 @@ export interface ChatResponse {
   memoryHits?: MemoryHit[];
   conversation?: ConversationSession;
   conversationContext?: ConversationContextPack;
+  sessionRequirementMemory?: SessionRequirementMemory;
 }
 
 export type DocumentWriteProgressEvent =
@@ -420,6 +439,7 @@ export type ChatStreamEvent =
       memoryHits?: MemoryHit[];
       conversation?: ConversationSession;
       conversationContext?: ConversationContextPack;
+      sessionRequirementMemory?: SessionRequirementMemory;
     }
   | {
       type: "done";
@@ -435,6 +455,7 @@ export type ChatStreamEvent =
       memoryHits?: MemoryHit[];
       conversation?: ConversationSession;
       conversationContext?: ConversationContextPack;
+      sessionRequirementMemory?: SessionRequirementMemory;
     }
   | { type: "memory_started"; runId: string; visibleMessage: string }
   | { type: "memory_completed"; runId: string; visibleMessage: string; memoryHits: MemoryHit[] }

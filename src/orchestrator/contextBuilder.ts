@@ -4,10 +4,13 @@ export function buildFinalPrompt(context: FinalContext): string {
   const answerStrategy = context.answerStrategy ?? context.skillPlan?.answerStrategy ?? context.routePlan.answerStrategy ?? "direct";
   const evidence = renderEvidence(context.evidencePack, answerStrategy);
   const conversationContext = renderConversationContext(context.conversationContext);
+  const sessionRequirementMemory = renderSessionRequirementMemory(context.sessionRequirementMemory);
   const memoryHits = context.memoryHits ?? context.evidencePack?.memoryHits ?? [];
 
   return `用户请求：
 ${context.request.message}
+
+${sessionRequirementMemory}
 
 ${conversationContext}
 
@@ -37,6 +40,22 @@ ${context.executionResult ? JSON.stringify({ status: context.executionResult.sta
 
 约束：
 ${context.constraints.map((item) => `- ${item}`).join("\n")}`;
+}
+
+function renderSessionRequirementMemory(memory: FinalContext["sessionRequirementMemory"]): string {
+  if (!memory) {
+    return "Session 用户需求 Memory（最高优先级）：无。";
+  }
+
+  const details = memory.details.length ? memory.details.map((item) => `- ${item}`).join("\n") : "- 无";
+  const openQuestions = memory.openQuestions.length ? memory.openQuestions.map((item) => `- ${item}`).join("\n") : "- 无";
+  return `Session 用户需求 Memory（最高优先级；只描述本 session 用户真实需求，不是外部证据；回答必须优先满足并随当前用户请求校正）：
+coreQuestion: ${memory.coreQuestion}
+currentUnderstanding: ${memory.currentUnderstanding}
+details:
+${details}
+openQuestions:
+${openQuestions}`;
 }
 
 function renderConversationContext(pack: FinalContext["conversationContext"]): string {

@@ -46,6 +46,7 @@ const server = createServer(async (request, response) => {
         ai: {
           chatConfigured: ai.canChat(config.ai.chatModel),
           routerConfigured: ai.canChat(config.ai.routerModel),
+          requirementMemoryConfigured: ai.canChat(config.ai.requirementMemoryModel),
           embeddingConfigured: ai.canEmbed()
         },
         storage: {

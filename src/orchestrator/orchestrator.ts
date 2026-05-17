@@ -13,6 +13,7 @@ import type {
   MemoryHit,
   RequestContext,
   RoutePlan,
+  SessionRequirementMemory,
   SkillExecutionResult,
   SkillObservation,
   SkillPlan,
@@ -34,6 +35,7 @@ import { ContextCompressor } from "../services/contextCompressor.js";
 import { CollectedContentWorkflow } from "../services/collectedContentWorkflow.js";
 import { ParallelRetriever } from "./parallelRetriever.js";
 import { DocumentResolver } from "./documentResolver.js";
+import { SessionRequirementMemoryService } from "../services/sessionRequirementMemoryService.js";
 
 export class Orchestrator {
   private readonly router: Router;
@@ -45,6 +47,7 @@ export class Orchestrator {
   private readonly conversationService: ConversationService;
   private readonly contextCompressor: ContextCompressor;
   private readonly collectedContentWorkflow: CollectedContentWorkflow;
+  private readonly sessionRequirementMemory: SessionRequirementMemoryService;
 
   constructor(
     private readonly config: AppConfig,
@@ -61,6 +64,7 @@ export class Orchestrator {
     this.conversationService = new ConversationService(sqlite);
     this.contextCompressor = new ContextCompressor(ai, config, sqlite, this.conversationService);
     this.collectedContentWorkflow = new CollectedContentWorkflow(sqlite, documents, memory);
+    this.sessionRequirementMemory = new SessionRequirementMemoryService(ai, config, sqlite);
   }
 
   async chat(input: { message: string; sessionId?: string; userId?: string; projectId?: string }): Promise<ChatResponse> {
@@ -68,7 +72,14 @@ export class Orchestrator {
     const conversation = this.conversationService.ensureConversationSession({ sessionId: input.sessionId, userId: input.userId, projectId: context.projectId, firstMessage: input.message });
     const shouldGenerateTitle = shouldGenerateConversationTitle(conversation, input.message);
     context.sessionId = conversation.id;
-    this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
+    const userMessage = this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
+    let sessionRequirementMemory: SessionRequirementMemory | undefined = await this.sessionRequirementMemory.refineBeforeAnswer({
+      sessionId: context.sessionId,
+      projectId: context.projectId,
+      userId: context.userId,
+      userMessage: context.message,
+      userMessageId: userMessage.id
+    });
 
     const sessionState = this.sqlite.getSessionState(context.sessionId);
     const routePlan = await this.router.route(context);
@@ -79,9 +90,10 @@ export class Orchestrator {
     routePlan.documentResolution = documentResolution;
     if (documentResolution.status === "ambiguous") {
       const answer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
-      this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer });
+      const assistantMessage = this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer });
+      sessionRequirementMemory = await this.refineSessionRequirementAfterAnswer({ context, userMessageId: userMessage.id, assistantMessageId: assistantMessage.id, answer, current: sessionRequirementMemory });
       await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer, enabled: shouldGenerateTitle });
-      return { answer, routePlan, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation };
+      return { answer, routePlan, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation, sessionRequirementMemory };
     }
     const skillPlan = this.skillPlanner.plan(context, routePlan, sessionState, loadCapabilities(), documentResolution, memoryHits);
     routePlan.skillPlan = skillPlan;
@@ -92,13 +104,14 @@ export class Orchestrator {
     let { skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan);
     evidencePack = evidencePack ? await this.documents.expandEvidencePack({ ...evidencePack, memoryHits, retrievalSources: [...(evidencePack.retrievalSources ?? []), "memory_items"] }) : undefined;
     const guardAnswer = guardedNoEvidenceAnswer(skillPlan, observation);
-    const generation = guardAnswer ? undefined : await this.generateAnswer(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
+    const generation = guardAnswer ? undefined : await this.generateAnswer(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory);
     const answer = guardAnswer ?? generation?.answer ?? "";
     const conversationContext = generation?.conversationContext;
 
-    this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer, contentType: executionResult ? "workflow_result" : "markdown" });
+    const assistantMessage = this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer, contentType: executionResult ? "workflow_result" : "markdown" });
+    sessionRequirementMemory = await this.refineSessionRequirementAfterAnswer({ context, userMessageId: userMessage.id, assistantMessageId: assistantMessage.id, answer, current: sessionRequirementMemory });
     await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer, enabled: shouldGenerateTitle });
-    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation, conversationContext };
+    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation, conversationContext, sessionRequirementMemory };
   }
 
   async chatStream(
@@ -109,7 +122,7 @@ export class Orchestrator {
     const conversation = this.conversationService.ensureConversationSession({ sessionId: input.sessionId, userId: input.userId, projectId: context.projectId, firstMessage: input.message });
     const shouldGenerateTitle = shouldGenerateConversationTitle(conversation, input.message);
     context.sessionId = conversation.id;
-    this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
+    const userMessage = this.conversationService.appendMessage({ sessionId: context.sessionId, role: "user", content: context.message, createdAt: context.createdAt });
 
     const runId = randomUUID();
     this.sqlite.createRun({
@@ -133,6 +146,7 @@ export class Orchestrator {
     let memoryHits: MemoryHit[] = [];
     let completedWithFallback = false;
     let conversationContext: ConversationContextPack | undefined;
+    let sessionRequirementMemory: SessionRequirementMemory | undefined;
     let assistantMessageId: string | undefined;
 
     const ensureAssistantMessage = (contentType: "markdown" | "workflow_result" | "error" = "markdown"): string => {
@@ -175,6 +189,15 @@ export class Orchestrator {
         projectId: context.projectId
       });
 
+      sessionRequirementMemory = await this.sessionRequirementMemory.refineBeforeAnswer({
+        sessionId: context.sessionId,
+        projectId: context.projectId,
+        userId: context.userId,
+        userMessage: context.message,
+        userMessageId: userMessage.id
+      });
+      await tracker.metadata({ sessionRequirementMemory }, "本轮用户需求 memory 已更新。");
+
       const sessionState = this.sqlite.getSessionState(context.sessionId);
       await tracker.stepStarted("router", "正在判断这是普通对话、资料查询还是工作流任务。");
       routePlan = await this.router.route(context);
@@ -191,10 +214,11 @@ export class Orchestrator {
         finalAnswer = renderAmbiguousDocumentAnswer(documentResolution.candidates);
         persistAssistantMessage(finalAnswer, "completed");
         await tracker.answerDelta(finalAnswer);
+        sessionRequirementMemory = await this.refineSessionRequirementAfterAnswer({ context, userMessageId: userMessage.id, assistantMessageId, answer: finalAnswer, current: sessionRequirementMemory });
         await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer: finalAnswer, enabled: shouldGenerateTitle });
         const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
         callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
-        const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext };
+        const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext, sessionRequirementMemory };
         await tracker.done(result, "completed");
         return result;
       }
@@ -221,7 +245,7 @@ export class Orchestrator {
         await tracker.observation(observation, "证据足够，开始生成回答。");
         await tracker.stepStarted("context", "正在整理证据和上下文。");
         callbacks.onEvent({ type: "context_compression_started", runId, visibleMessage: "正在压缩历史对话上下文。", sessionId: context.sessionId });
-        const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
+        const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory);
         conversationContext = generationInput.conversationContext;
         if (conversationContext) callbacks.onEvent({ type: "context_compression_completed", runId, visibleMessage: "对话上下文已整理。", conversationContext });
         await tracker.stepCompleted("context", "上下文已整理完成。", {
@@ -231,7 +255,7 @@ export class Orchestrator {
           skillResultCount: skillResults.length
         });
 
-        await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits });
+        await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory });
         await tracker.stepStarted("generation", "正在生成最终回答。");
         let usedFallback = false;
         try {
@@ -264,10 +288,11 @@ export class Orchestrator {
       }
 
       persistAssistantMessage(finalAnswer, completedWithFallback ? "completed_with_fallback" : "completed", executionResult ? "workflow_result" : "markdown");
+      sessionRequirementMemory = await this.refineSessionRequirementAfterAnswer({ context, userMessageId: userMessage.id, assistantMessageId, answer: finalAnswer, current: sessionRequirementMemory });
       await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer: finalAnswer, enabled: shouldGenerateTitle });
       const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
       callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
-      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext };
+      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext, sessionRequirementMemory };
       await tracker.done(result, completedWithFallback ? "completed_with_fallback" : "completed");
       return result;
     } catch (error) {
@@ -458,9 +483,10 @@ export class Orchestrator {
     skillPlan?: SkillPlan,
     skillResults?: SkillExecutionResult[],
     observation?: SkillObservation,
-    memoryHits: MemoryHit[] = []
+    memoryHits: MemoryHit[] = [],
+    sessionRequirementMemory?: SessionRequirementMemory
   ): Promise<{ answer: string; conversationContext?: ConversationContextPack }> {
-    const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits);
+    const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory);
     if (generationInput.kind === "static") {
       return { answer: generationInput.answer, conversationContext: generationInput.conversationContext };
     }
@@ -478,7 +504,8 @@ export class Orchestrator {
     skillPlan?: SkillPlan,
     skillResults?: SkillExecutionResult[],
     observation?: SkillObservation,
-    memoryHits: MemoryHit[] = []
+    memoryHits: MemoryHit[] = [],
+    sessionRequirementMemory?: SessionRequirementMemory
   ): Promise<GenerationInput> {
     const conversationContext = await this.contextCompressor.buildContextPack({ sessionId: context.sessionId, projectId: context.projectId, userId: context.userId });
     if (executionResult?.capabilityId === "workflow.ingest_text_database" || executionResult?.capabilityId === "workflow.ingest_wechat_article" || executionResult?.capabilityId === "workflow.ingest_collected_content") {
@@ -505,7 +532,8 @@ export class Orchestrator {
       answerStrategy,
       constraints: defaultConstraints(answerStrategy),
       memoryHits,
-      conversationContext
+      conversationContext,
+      sessionRequirementMemory
     });
     return { kind: "model", prompt, conversationContext };
   }
@@ -518,6 +546,24 @@ export class Orchestrator {
     for await (const chunk of this.ai.streamChat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.prompt) })) {
       yield chunk;
     }
+  }
+
+  private async refineSessionRequirementAfterAnswer(params: {
+    context: RequestContext;
+    userMessageId: string;
+    assistantMessageId?: string;
+    answer: string;
+    current?: SessionRequirementMemory;
+  }): Promise<SessionRequirementMemory | undefined> {
+    return await this.sessionRequirementMemory.refineAfterAnswer({
+      sessionId: params.context.sessionId,
+      projectId: params.context.projectId,
+      userId: params.context.userId,
+      userMessage: params.context.message,
+      userMessageId: params.userMessageId,
+      assistantAnswer: params.answer,
+      assistantMessageId: params.assistantMessageId
+    }) ?? params.current;
   }
 
   private async updateConversationTitleAfterFirstTurn(params: {

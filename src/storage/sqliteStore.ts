@@ -21,6 +21,7 @@ import type {
   RunStatus,
   RunStepName,
   RunStepStatus,
+  SessionRequirementMemory,
   StoredChunk,
   StoredDocument,
   StoredDocumentInput,
@@ -842,6 +843,53 @@ export class SqliteStore {
     return rows.map(mapConversationSummary);
   }
 
+  getSessionRequirementMemory(sessionId: string): SessionRequirementMemory | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM session_requirement_memory WHERE session_id = ?")
+      .get(sessionId) as SessionRequirementMemoryRow | undefined;
+    return row ? mapSessionRequirementMemory(row) : undefined;
+  }
+
+  upsertSessionRequirementMemory(memory: SessionRequirementMemory): SessionRequirementMemory {
+    this.db
+      .prepare(
+        `INSERT INTO session_requirement_memory (
+          id, session_id, project_id, user_id, core_question, current_understanding,
+          details_json, open_questions_json, first_user_message_id, last_user_message_id,
+          last_assistant_message_id, model, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id) DO UPDATE SET
+          project_id = excluded.project_id,
+          user_id = excluded.user_id,
+          core_question = excluded.core_question,
+          current_understanding = excluded.current_understanding,
+          details_json = excluded.details_json,
+          open_questions_json = excluded.open_questions_json,
+          first_user_message_id = COALESCE(session_requirement_memory.first_user_message_id, excluded.first_user_message_id),
+          last_user_message_id = excluded.last_user_message_id,
+          last_assistant_message_id = excluded.last_assistant_message_id,
+          model = excluded.model,
+          updated_at = excluded.updated_at`
+      )
+      .run(
+        memory.id,
+        memory.sessionId,
+        memory.projectId,
+        memory.userId ?? null,
+        memory.coreQuestion,
+        memory.currentUnderstanding,
+        JSON.stringify(memory.details),
+        JSON.stringify(memory.openQuestions),
+        memory.firstUserMessageId ?? null,
+        memory.lastUserMessageId ?? null,
+        memory.lastAssistantMessageId ?? null,
+        memory.model,
+        memory.createdAt,
+        memory.updatedAt
+      );
+    return this.getSessionRequirementMemory(memory.sessionId) ?? memory;
+  }
+
   createCollectedItem(params: {
     id?: string;
     projectId: string;
@@ -1156,6 +1204,26 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS idx_conversation_summaries_session ON conversation_summaries(session_id, updated_at);
 
+      CREATE TABLE IF NOT EXISTS session_requirement_memory (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        user_id TEXT,
+        core_question TEXT NOT NULL,
+        current_understanding TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        open_questions_json TEXT NOT NULL,
+        first_user_message_id TEXT,
+        last_user_message_id TEXT,
+        last_assistant_message_id TEXT,
+        model TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_session_requirement_project_updated ON session_requirement_memory(project_id, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_session_requirement_user_updated ON session_requirement_memory(user_id, updated_at);
+
       CREATE TABLE IF NOT EXISTS collected_items (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
@@ -1345,6 +1413,23 @@ interface ConversationSummaryRow {
   updated_at: string;
 }
 
+interface SessionRequirementMemoryRow {
+  id: string;
+  session_id: string;
+  project_id: string;
+  user_id: string | null;
+  core_question: string;
+  current_understanding: string;
+  details_json: string;
+  open_questions_json: string;
+  first_user_message_id: string | null;
+  last_user_message_id: string | null;
+  last_assistant_message_id: string | null;
+  model: string;
+  created_at: string;
+  updated_at: string;
+}
+
 interface CollectedItemRow {
   id: string;
   project_id: string;
@@ -1487,6 +1572,25 @@ function mapConversationSummary(row: ConversationSummaryRow): ConversationSummar
     summaryText: row.summary_text,
     model: row.model,
     tokenEstimate: row.token_estimate,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapSessionRequirementMemory(row: SessionRequirementMemoryRow): SessionRequirementMemory {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    projectId: row.project_id,
+    userId: row.user_id ?? undefined,
+    coreQuestion: row.core_question,
+    currentUnderstanding: row.current_understanding,
+    details: safeParseStringArray(row.details_json),
+    openQuestions: safeParseStringArray(row.open_questions_json),
+    firstUserMessageId: row.first_user_message_id ?? undefined,
+    lastUserMessageId: row.last_user_message_id ?? undefined,
+    lastAssistantMessageId: row.last_assistant_message_id ?? undefined,
+    model: row.model,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
