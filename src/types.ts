@@ -323,6 +323,14 @@ export interface DocumentResolution {
   candidates: DocumentCandidate[];
 }
 
+export interface ReasoningCandidate {
+  id: string;
+  model: string;
+  status: "success" | "failed";
+  content?: string;
+  error?: string;
+}
+
 export interface EvidencePack {
   query: string;
   skillId?: string;
@@ -361,6 +369,7 @@ export interface FinalContext {
   memoryHits?: MemoryHit[];
   conversationContext?: ConversationContextPack;
   sessionRequirementMemory?: SessionRequirementMemory;
+  reasoningCandidates?: ReasoningCandidate[];
 }
 
 export interface ChatResponse {
@@ -375,6 +384,7 @@ export interface ChatResponse {
   conversation?: ConversationSession;
   conversationContext?: ConversationContextPack;
   sessionRequirementMemory?: SessionRequirementMemory;
+  reasoningCandidates?: ReasoningCandidate[];
 }
 
 export type DocumentWriteProgressEvent =
@@ -440,6 +450,7 @@ export type ChatStreamEvent =
       conversation?: ConversationSession;
       conversationContext?: ConversationContextPack;
       sessionRequirementMemory?: SessionRequirementMemory;
+      reasoningCandidates?: ReasoningCandidate[];
     }
   | {
       type: "done";
@@ -456,6 +467,7 @@ export type ChatStreamEvent =
       conversation?: ConversationSession;
       conversationContext?: ConversationContextPack;
       sessionRequirementMemory?: SessionRequirementMemory;
+      reasoningCandidates?: ReasoningCandidate[];
     }
   | { type: "memory_started"; runId: string; visibleMessage: string }
   | { type: "memory_completed"; runId: string; visibleMessage: string; memoryHits: MemoryHit[] }

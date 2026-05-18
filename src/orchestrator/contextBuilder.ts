@@ -1,4 +1,4 @@
-import type { AnswerStrategy, ExpandedEvidenceItem, EvidenceItem, FinalContext, MemoryHit, RoutePlan, SkillExecutionResult, SkillPlan } from "../types.js";
+import type { AnswerStrategy, ExpandedEvidenceItem, EvidenceItem, FinalContext, MemoryHit, ReasoningCandidate, RoutePlan, SkillExecutionResult, SkillPlan } from "../types.js";
 
 export function buildFinalPrompt(context: FinalContext): string {
   const answerStrategy = context.answerStrategy ?? context.skillPlan?.answerStrategy ?? context.routePlan.answerStrategy ?? "direct";
@@ -21,6 +21,9 @@ AnswerStrategy：${answerStrategy}
 
 MemoryHits Compact（仅导航线索，不是原文证据；需要原文引用时必须回到 document_chunks/chunks）：
 ${memoryHits.length ? JSON.stringify(compactMemoryHits(memoryHits), null, 2) : "无 MemoryHits。"}
+
+并行推理候选（由至少 3 个相互隔离的资料推理线程汇总；仅作为候选观点，最终回答仍必须核对证据包）：
+${renderReasoningCandidates(context.reasoningCandidates)}
 
 SkillPlan（compact）：
 ${context.skillPlan ? JSON.stringify(compactSkillPlan(context.skillPlan), null, 2) : "无 SkillPlan。"}
@@ -69,6 +72,20 @@ function renderConversationContext(pack: FinalContext["conversationContext"]): s
     ? pack.recentMessages.map((message) => `[${message.role}] ${message.content}`).join("\n\n")
     : "无。";
   return `${compressed}\n\n最近两轮原文（优先级高于压缩摘要，保持 role 和 content）：\n${recent}`;
+}
+
+function renderReasoningCandidates(candidates: ReasoningCandidate[] | undefined): string {
+  if (!candidates?.length) {
+    return "无并行推理候选。";
+  }
+
+  return candidates.map((candidate, index) => {
+    const header = `[候选 ${index + 1}] id=${candidate.id} model=${candidate.model} status=${candidate.status}`;
+    if (candidate.status === "failed") {
+      return `${header}\nerror=${candidate.error ?? "unknown"}`;
+    }
+    return `${header}\n${truncate(candidate.content ?? "", 4000)}`;
+  }).join("\n\n");
 }
 
 export function summarizeSkillResults(skillResults: SkillExecutionResult[]): Array<{

@@ -42,6 +42,7 @@ AI_BASE_URL=https://api.openai.com/v1
 AI_API_KEY=sk-your-key
 AI_ROUTER_MODEL=gpt-4.1-mini
 AI_CHAT_MODEL=gpt-4.1
+AI_REASONING_MODELS="gpt-4.1 gpt-4.1-mini gpt-4.1"
 AI_EMBEDDING_MODEL=text-embedding-3-small
 AI_EMBEDDING_DIM=1536
 ```
@@ -61,6 +62,7 @@ DEFAULT_PROJECT_ID=default
 
 - `SQLITE_PATH` 用于保存文档、切片、会话、RoutePlan 日志。
 - `LANCEDB_URI` 用于保存本地向量库文件。
+- `AI_REASONING_MODELS` 可选；读取 document 并取得 evidence 后，系统会至少启动 3 个相互隔离的推理线程生成候选，再交给最终生成模型综合。未配置时会回退使用 `AI_CHAT_MODEL`。
 - `AI_EMBEDDING_DIM` 必须与云端 Embedding 模型实际输出维度一致。
 
 ## 4. 启动项目

@@ -11,6 +11,7 @@ import type {
   EvidenceItem,
   EvidencePack,
   MemoryHit,
+  ReasoningCandidate,
   RequestContext,
   RoutePlan,
   SessionRequirementMemory,
@@ -35,6 +36,7 @@ import { ContextCompressor } from "../services/contextCompressor.js";
 import { CollectedContentWorkflow } from "../services/collectedContentWorkflow.js";
 import { ParallelRetriever } from "./parallelRetriever.js";
 import { DocumentResolver } from "./documentResolver.js";
+import { ParallelReasoner } from "./parallelReasoner.js";
 import { SessionRequirementMemoryService } from "../services/sessionRequirementMemoryService.js";
 
 export class Orchestrator {
@@ -44,6 +46,7 @@ export class Orchestrator {
   private readonly skillExecutor: SkillExecutor;
   private readonly parallelRetriever: ParallelRetriever;
   private readonly documentResolver: DocumentResolver;
+  private readonly parallelReasoner: ParallelReasoner;
   private readonly conversationService: ConversationService;
   private readonly contextCompressor: ContextCompressor;
   private readonly collectedContentWorkflow: CollectedContentWorkflow;
@@ -61,6 +64,7 @@ export class Orchestrator {
     this.skillExecutor = new SkillExecutor(documents);
     this.parallelRetriever = new ParallelRetriever(memory, documents);
     this.documentResolver = new DocumentResolver(sqlite);
+    this.parallelReasoner = new ParallelReasoner(ai, config);
     this.conversationService = new ConversationService(sqlite);
     this.contextCompressor = new ContextCompressor(ai, config, sqlite, this.conversationService);
     this.collectedContentWorkflow = new CollectedContentWorkflow(sqlite, documents, memory);
@@ -111,7 +115,7 @@ export class Orchestrator {
     const assistantMessage = this.conversationService.appendMessage({ sessionId: context.sessionId, role: "assistant", content: answer, contentType: executionResult ? "workflow_result" : "markdown" });
     sessionRequirementMemory = await this.refineSessionRequirementAfterAnswer({ context, userMessageId: userMessage.id, assistantMessageId: assistantMessage.id, answer, current: sessionRequirementMemory });
     await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer, enabled: shouldGenerateTitle });
-    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation, conversationContext, sessionRequirementMemory };
+    return { answer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: this.sqlite.getConversationSession(context.sessionId) ?? conversation, conversationContext, sessionRequirementMemory, reasoningCandidates: generation?.reasoningCandidates };
   }
 
   async chatStream(
@@ -147,6 +151,7 @@ export class Orchestrator {
     let completedWithFallback = false;
     let conversationContext: ConversationContextPack | undefined;
     let sessionRequirementMemory: SessionRequirementMemory | undefined;
+    let reasoningCandidates: ReasoningCandidate[] | undefined;
     let assistantMessageId: string | undefined;
 
     const ensureAssistantMessage = (contentType: "markdown" | "workflow_result" | "error" = "markdown"): string => {
@@ -218,7 +223,7 @@ export class Orchestrator {
         await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer: finalAnswer, enabled: shouldGenerateTitle });
         const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
         callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
-        const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext, sessionRequirementMemory };
+        const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext, sessionRequirementMemory, reasoningCandidates };
         await tracker.done(result, "completed");
         return result;
       }
@@ -247,15 +252,17 @@ export class Orchestrator {
         callbacks.onEvent({ type: "context_compression_started", runId, visibleMessage: "正在压缩历史对话上下文。", sessionId: context.sessionId });
         const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory);
         conversationContext = generationInput.conversationContext;
+        reasoningCandidates = generationInput.reasoningCandidates;
         if (conversationContext) callbacks.onEvent({ type: "context_compression_completed", runId, visibleMessage: "对话上下文已整理。", conversationContext });
         await tracker.stepCompleted("context", "上下文已整理完成。", {
           hasEvidence: Boolean(evidencePack),
           evidenceCount: evidencePack?.items.length ?? 0,
           hasExecutionResult: Boolean(executionResult),
-          skillResultCount: skillResults.length
+          skillResultCount: skillResults.length,
+          reasoningCandidateCount: reasoningCandidates?.length ?? 0
         });
 
-        await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory });
+        await tracker.metadata({ routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory, reasoningCandidates });
         await tracker.stepStarted("generation", "正在生成最终回答。");
         let usedFallback = false;
         try {
@@ -292,7 +299,7 @@ export class Orchestrator {
       await this.updateConversationTitleAfterFirstTurn({ sessionId: context.sessionId, question: context.message, answer: finalAnswer, enabled: shouldGenerateTitle });
       const updatedConversation = this.sqlite.getConversationSession(context.sessionId) ?? conversation;
       callbacks.onEvent({ type: "conversation_updated", runId, visibleMessage: "对话已更新。", conversation: updatedConversation });
-      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext, sessionRequirementMemory };
+      const result = { answer: finalAnswer, routePlan, evidencePack, executionResult, skillPlan, skillResults, observation, memoryHits, conversation: updatedConversation, conversationContext, sessionRequirementMemory, reasoningCandidates };
       await tracker.done(result, completedWithFallback ? "completed_with_fallback" : "completed");
       return result;
     } catch (error) {
@@ -485,14 +492,15 @@ export class Orchestrator {
     observation?: SkillObservation,
     memoryHits: MemoryHit[] = [],
     sessionRequirementMemory?: SessionRequirementMemory
-  ): Promise<{ answer: string; conversationContext?: ConversationContextPack }> {
+  ): Promise<{ answer: string; conversationContext?: ConversationContextPack; reasoningCandidates?: ReasoningCandidate[] }> {
     const generationInput = await this.prepareGenerationInput(context, routePlan, executionResult, evidencePack, skillPlan, skillResults, observation, memoryHits, sessionRequirementMemory);
     if (generationInput.kind === "static") {
-      return { answer: generationInput.answer, conversationContext: generationInput.conversationContext };
+      return { answer: generationInput.answer, conversationContext: generationInput.conversationContext, reasoningCandidates: generationInput.reasoningCandidates };
     }
     return {
       answer: await this.ai.chat({ model: this.config.ai.chatModel, temperature: 0.3, messages: buildFinalMessages(generationInput.prompt) }),
-      conversationContext: generationInput.conversationContext
+      conversationContext: generationInput.conversationContext,
+      reasoningCandidates: generationInput.reasoningCandidates
     };
   }
 
@@ -521,7 +529,7 @@ export class Orchestrator {
     }
 
     const answerStrategy = skillPlan?.answerStrategy ?? routePlan.answerStrategy ?? "direct";
-    const prompt = buildFinalPrompt({
+    const finalContext = {
       request: context,
       routePlan,
       evidencePack,
@@ -534,8 +542,10 @@ export class Orchestrator {
       memoryHits,
       conversationContext,
       sessionRequirementMemory
-    });
-    return { kind: "model", prompt, conversationContext };
+    };
+    const reasoningCandidates = await this.parallelReasoner.generateCandidates(finalContext);
+    const prompt = buildFinalPrompt({ ...finalContext, reasoningCandidates });
+    return { kind: "model", prompt, conversationContext, reasoningCandidates };
   }
 
   private async *generateAnswerStreamFromPrepared(generationInput: GenerationInput): AsyncGenerator<string> {
@@ -622,8 +632,8 @@ export class Orchestrator {
 }
 
 type GenerationInput =
-  | { kind: "static"; answer: string; conversationContext?: ConversationContextPack }
-  | { kind: "model"; prompt: string; conversationContext?: ConversationContextPack };
+  | { kind: "static"; answer: string; conversationContext?: ConversationContextPack; reasoningCandidates?: ReasoningCandidate[] }
+  | { kind: "model"; prompt: string; conversationContext?: ConversationContextPack; reasoningCandidates?: ReasoningCandidate[] };
 
 
 export function isTimeoutError(error: unknown): boolean {
