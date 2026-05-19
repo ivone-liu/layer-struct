@@ -72,6 +72,57 @@ export class DocumentService {
     return { document: this.sqlite.getDocument(documentId) ?? { ...document, tags: tags.map((tag) => tag.name) }, chunkCount: chunks.length };
   }
 
+  async writeDocumentDeferred(input: StoredDocumentInput): Promise<{ document: StoredDocument; chunkCount: number }> {
+    const createdAt = new Date().toISOString();
+    const documentId = randomUUID();
+    const chunks = chunkText(input.content);
+    const tagSuggestions = await this.generateDocumentTags({
+      title: input.title,
+      source: input.source,
+      projectId: input.projectId,
+      content: input.content,
+      manualTags: input.tags
+    });
+
+    const document = this.sqlite.insertDocument({
+      ...input,
+      metadata: { ...(input.metadata ?? {}), tags: tagSuggestions.map((tag) => tag.name) },
+      tags: tagSuggestions.map((tag) => tag.name),
+      id: documentId,
+      createdAt
+    });
+    this.sqlite.replaceDocumentTags(documentId, input.projectId, tagSuggestions);
+
+    void this.finishDocumentWriteInBackground({ documentId, createdAt, input, chunks });
+    return { document: this.sqlite.getDocument(documentId) ?? document, chunkCount: chunks.length };
+  }
+
+  private async finishDocumentWriteInBackground(params: { documentId: string; createdAt: string; input: StoredDocumentInput; chunks: string[] }): Promise<void> {
+    try {
+      const chunkRecords = params.chunks.map((content, index) => ({
+        id: randomUUID(),
+        documentId: params.documentId,
+        chunkIndex: index,
+        content,
+        createdAt: params.createdAt
+      }));
+
+      for (const chunk of chunkRecords) {
+        this.sqlite.insertChunk(chunk);
+      }
+
+      await this.embedAndStoreChunks({
+        documentId: params.documentId,
+        projectId: params.input.projectId,
+        title: params.input.title,
+        source: params.input.source,
+        chunks: chunkRecords
+      });
+    } catch (error) {
+      console.error('[document.write.deferred] failed', { documentId: params.documentId, error });
+    }
+  }
+
   async updateDocument(
     input: StoredDocumentUpdateInput,
     onProgress?: (event: DocumentWriteProgressEvent) => void | Promise<void>

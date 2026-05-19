@@ -16,8 +16,9 @@ export class ParallelRetriever {
 
   async searchHints(context: RequestContext, routePlan: RoutePlan): Promise<RetrievalHints> {
     const query = routePlan.resolvedQuery || routePlan.searchQueries[0] || context.message;
+    const shouldSearchMemory = normalizeForCompare(query) !== normalizeForCompare(context.message);
     const [memoryResult, documentResult] = await Promise.allSettled([
-      this.memoryService.search({ query, projectId: context.projectId, userId: context.userId, limit: 6 }),
+      shouldSearchMemory ? this.memoryService.search({ query, projectId: context.projectId, userId: context.userId, limit: 6 }) : Promise.resolve([]),
       Promise.resolve(this.documentService.searchDocuments({ query, projectId: context.projectId, limit: 8 }))
     ]);
 
@@ -30,4 +31,9 @@ export class ParallelRetriever {
       }
     };
   }
+}
+
+
+function normalizeForCompare(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
 }
