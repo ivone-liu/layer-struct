@@ -312,18 +312,22 @@ export class Orchestrator {
   }
 
   async writeDocument(input: StoredDocumentInput): Promise<ExecutionResult> {
-    const result = await this.documents.writeDocument(input);
-    await this.memory.createDocumentAnchorMemory({
-      projectId: result.document.projectId,
-      documentId: result.document.id,
-      title: result.document.title,
-      source: result.document.source,
-      contentSample: result.document.content.slice(0, 1600)
-    });
+    const result = await this.documents.writeDocumentDeferred(input);
+    void this.memory
+      .createDocumentAnchorMemory({
+        projectId: result.document.projectId,
+        documentId: result.document.id,
+        title: result.document.title,
+        source: result.document.source,
+        contentSample: result.document.content.slice(0, 1600)
+      })
+      .catch((error) => {
+        console.error("[memory.document_anchor] deferred write failed", { documentId: result.document.id, error });
+      });
     return {
       status: "success",
       capabilityId: "workflow.ingest_text_database",
-      message: "文档已写入 SQLite、LanceDB，并创建 document_anchor memory。",
+      message: "文档已受理，SQLite/LanceDB 与 memory 正在异步写入。你可以继续提问，无需等待写入完成。",
       output: { documentId: result.document.id, title: result.document.title, tags: result.document.tags, chunkCount: result.chunkCount }
     };
   }
