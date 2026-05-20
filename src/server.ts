@@ -1,6 +1,7 @@
 import { createReadStream, existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { OpenAiCompatibleClient } from "./ai/openAiCompatibleClient.js";
 import { loadConfig } from "./config/env.js";
@@ -10,6 +11,7 @@ import { DocumentService } from "./services/documentService.js";
 import { MemoryService } from "./services/memoryService.js";
 import { ConversationService } from "./services/conversationService.js";
 import { CollectedContentWorkflow } from "./services/collectedContentWorkflow.js";
+import { InteractionLogger } from "./services/interactionLogger.js";
 import { LanceVectorStore } from "./storage/lanceVectorStore.js";
 import { SqliteStore } from "./storage/sqliteStore.js";
 import type { ChatStreamEvent, DocumentTagSuggestion, StoredDocumentInput, StoredDocumentUpdateInput } from "./types.js";
@@ -29,6 +31,7 @@ const conversations = new ConversationService(sqlite);
 const collectedWorkflow = new CollectedContentWorkflow(sqlite, documents, memory);
 const orchestrator = new Orchestrator(config, sqlite, documents, ai, memory);
 const mcp = new McpClientManager();
+const interactionLogger = new InteractionLogger(config.log);
 
 const publicDir = path.resolve(process.cwd(), "public");
 
@@ -189,22 +192,56 @@ const server = createServer(async (request, response) => {
 
     if (request.method === "POST" && url.pathname === "/api/chat") {
       const body = await readJsonBody<{ message?: string; sessionId?: string; projectId?: string; userId?: string }>(request);
+      const requestLogId = randomUUID();
+      interactionLogger.requestStarted({
+        requestLogId,
+        endpoint: "/api/chat",
+        input: { message: body.message, sessionId: body.sessionId, projectId: body.projectId, userId: body.userId }
+      });
       if (!body.message?.trim()) {
+        interactionLogger.requestFailed({
+          requestLogId,
+          endpoint: "/api/chat",
+          error: "message is required",
+          output: { statusCode: 400 }
+        });
         return json(response, 400, { error: "message is required" });
       }
 
-      const result = await orchestrator.chat({
-        message: body.message,
-        sessionId: body.sessionId,
-        projectId: body.projectId,
-        userId: body.userId
-      });
-      return json(response, 200, result);
+      try {
+        const result = await orchestrator.chat({
+          message: body.message,
+          sessionId: body.sessionId,
+          projectId: body.projectId,
+          userId: body.userId
+        });
+        interactionLogger.requestCompleted({
+          requestLogId,
+          endpoint: "/api/chat",
+          output: result as unknown as Record<string, unknown>
+        });
+        return json(response, 200, result);
+      } catch (error) {
+        interactionLogger.requestFailed({ requestLogId, endpoint: "/api/chat", error });
+        throw error;
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/api/chat/stream") {
       const body = await readJsonBody<{ message?: string; sessionId?: string; projectId?: string; userId?: string }>(request);
+      const requestLogId = randomUUID();
+      interactionLogger.requestStarted({
+        requestLogId,
+        endpoint: "/api/chat/stream",
+        input: { message: body.message, sessionId: body.sessionId, projectId: body.projectId, userId: body.userId }
+      });
       if (!body.message?.trim()) {
+        interactionLogger.requestFailed({
+          requestLogId,
+          endpoint: "/api/chat/stream",
+          error: "message is required",
+          output: { statusCode: 400 }
+        });
         return json(response, 400, { error: "message is required" });
       }
 
@@ -217,7 +254,7 @@ const server = createServer(async (request, response) => {
 
       let streamErrorEmitted = false;
       try {
-        await orchestrator.chatStream(
+        const result = await orchestrator.chatStream(
           {
             message: body.message,
             sessionId: body.sessionId,
@@ -226,6 +263,7 @@ const server = createServer(async (request, response) => {
           },
           {
             onEvent: (event) => {
+              interactionLogger.streamEvent({ requestLogId, event });
               if (event.type === "error") {
                 streamErrorEmitted = true;
               }
@@ -235,15 +273,23 @@ const server = createServer(async (request, response) => {
             }
           }
         );
+        interactionLogger.requestCompleted({
+          requestLogId,
+          endpoint: "/api/chat/stream",
+          output: result as unknown as Record<string, unknown>
+        });
       } catch (error) {
+        interactionLogger.requestFailed({ requestLogId, endpoint: "/api/chat/stream", error });
         if (!streamErrorEmitted && !response.writableEnded) {
           const friendlyMessage = formatUserFacingError(error);
-          writeSse(response, {
+          const event: ChatStreamEvent = {
             type: "error",
             error: friendlyMessage,
             friendlyMessage,
             debug: { rawError: error instanceof Error ? error.message : String(error) }
-          });
+          };
+          interactionLogger.streamEvent({ requestLogId, event });
+          writeSse(response, event);
         }
       } finally {
         response.end();

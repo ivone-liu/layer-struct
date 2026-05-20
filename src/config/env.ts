@@ -6,6 +6,10 @@ const dotEnv = loadDotEnv(path.resolve(process.cwd(), ".env"));
 export interface AppConfig {
   port: number;
   dataDir: string;
+  log: {
+    channel: "none" | "daily";
+    dir: string;
+  };
   sqlitePath: string;
   lanceDbUri: string;
   lanceDbTable: string;
@@ -81,6 +85,16 @@ function readString(key: string, fallback = ""): string {
   return process.env[key] ?? dotEnv[key] ?? fallback;
 }
 
+function readStringAny(keys: string[], fallback = ""): string {
+  for (const key of keys) {
+    const value = process.env[key] ?? dotEnv[key];
+    if (value !== undefined) {
+      return value;
+    }
+  }
+  return fallback;
+}
+
 function readNumber(key: string, fallback: number): number {
   const value = readString(key);
   if (!value) {
@@ -95,6 +109,10 @@ export function loadConfig(): AppConfig {
   return {
     port: readNumber("PORT", 3000),
     dataDir,
+    log: {
+      channel: normalizeLogChannel(readStringAny(["LOG_CHANNEL", "log_channel"], "none")),
+      dir: readStringAny(["LOG_DIR", "log_dir"], "./log")
+    },
     sqlitePath: readString("SQLITE_PATH", path.join(dataDir, "orchestrator.sqlite")),
     lanceDbUri: readString("LANCEDB_URI", path.join(dataDir, "lancedb")),
     lanceDbTable: readString("LANCEDB_TABLE", "document_chunks"),
@@ -140,6 +158,11 @@ export function loadConfig(): AppConfig {
       streamTotalTimeoutMs: readNumber("AI_STREAM_TOTAL_TIMEOUT_MS", 180000)
     }
   };
+}
+
+function normalizeLogChannel(value: string): "none" | "daily" {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "daily" ? "daily" : "none";
 }
 
 function splitArgs(value: string): string[] {
