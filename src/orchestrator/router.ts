@@ -43,6 +43,7 @@ function routerSystemPrompt(capabilities: ReturnType<typeof loadCapabilities>): 
 任务类型只能是 chat、rag_chat、skill_call、workflow。
 当用户要求保存、采集、收集、记录、入库、存为资料、保存到知识库、写入数据库时，优先选择 workflow.ingest_collected_content。
 当用户消息中包含 https://mp.weixin.qq.com/ 开头链接，并要求保存/入库/记录公众号文章内容时，选择 workflow.ingest_wechat_article，并提取 url。
+如果用户同时要求执行 workflow 与回答/总结/分析/查询，不要二选一：taskType 可保持 workflow，但必须同时设置 needsWorkflow=true、needsSkill=true、needsRag=true，并在 candidateCapabilities 中同时包含 workflow 与检索/查询 skill；answerStrategy 使用 multi_step 或 rag。
 当用户要求查询数据库、知识库、根据资料回答、检索资料时，选择 rag_chat 或 skill_call。语义/相似/RAG/向量检索优先 skill.lancedb_query；SQLite/SQL/元数据/标题/来源/最近/精确关键词查询优先 skill.sqlite_query。
 如果用户实际依赖已保存资料，即使没有说“查询”，也必须标记 needsSkill=true、needsRag=true、requiresEvidence=true，不能默认 chat。包括：原文、引用、具体段落、出处、文中怎么说、哪一段、摘录；这篇文章、上面那篇、刚才保存、刚才写入、最近保存；根据资料、从库里、知识库、数据库、历史记录、已保存内容；帮我总结刚才那篇、提炼刚才那篇、详细展开刚才那篇。
 如果用户要原文/出处/引用/具体段落，answerStrategy 必须是 citation 且 requiresEvidence=true。
@@ -74,20 +75,29 @@ ${capabilities.map((capability) => `- ${capability.id}: ${capability.description
 function routeByRules(message: string): RoutePlan {
   const wechatUrl = extractWeChatArticleUrl(message);
   if (wechatUrl && hasWriteIntent(message)) {
+    const postWorkflowQuery = extractPostWorkflowAnswerQuery(message, wechatUrl);
+    const querySkill = selectQuerySkill(message);
     return normalizeRoutePlan(
       {
         taskType: "workflow",
-        needsRag: false,
+        needsRag: Boolean(postWorkflowQuery),
         needsMemory: false,
-        needsSkill: false,
+        needsSkill: Boolean(postWorkflowQuery),
         needsWorkflow: true,
-        capabilityQuery: "保存公众号文章 WeSpy 微信文章入库",
-        searchQueries: [],
-        candidateCapabilities: ["workflow.ingest_wechat_article"],
-        extractedParams: { url: wechatUrl },
+        capabilityQuery: postWorkflowQuery
+          ? "保存公众号文章后继续检索/回答"
+          : "保存公众号文章 WeSpy 微信文章入库",
+        searchQueries: postWorkflowQuery ? [postWorkflowQuery] : [],
+        candidateCapabilities: postWorkflowQuery ? ["workflow.ingest_wechat_article", querySkill] : ["workflow.ingest_wechat_article"],
+        extractedParams: postWorkflowQuery ? { url: wechatUrl, query: postWorkflowQuery } : { url: wechatUrl },
         missingParams: [],
-        confidence: 0.92,
-        rationale: "规则识别到公众号文章链接和保存/入库意图。"
+        confidence: postWorkflowQuery ? 0.9 : 0.92,
+        rationale: postWorkflowQuery
+          ? "规则识别到公众号文章入库后还要继续回答，需要编排 workflow + skill。"
+          : "规则识别到公众号文章链接和保存/入库意图。",
+        answerStrategy: postWorkflowQuery ? "multi_step" : "workflow",
+        requiresEvidence: Boolean(postWorkflowQuery),
+        resolvedQuery: postWorkflowQuery
       },
       message
     );
@@ -217,13 +227,14 @@ function normalizeRoutePlan(plan: RoutePlan, message: string): RoutePlan {
     candidateCapabilities.push(selectQuerySkill(message));
   }
 
-  const evidenceIntent = hasImplicitEvidenceIntent(message);
-  const answerStrategy = normalizeAnswerStrategy(plan.answerStrategy, message, taskType, evidenceIntent);
+  const postWorkflowAnswerIntent = hasPostWorkflowAnswerIntent(message);
+  const evidenceIntent = hasImplicitEvidenceIntent(message) || postWorkflowAnswerIntent;
   const needsRag = Boolean(plan.needsRag || taskType === "rag_chat" || evidenceIntent);
   const needsSkill = Boolean(plan.needsSkill || taskType === "skill_call" || evidenceIntent || needsRag);
-  const requiresEvidence = Boolean(plan.requiresEvidence || evidenceIntent || answerStrategy === "citation");
+  const answerStrategy = normalizeAnswerStrategy(plan.answerStrategy, message, taskType, evidenceIntent, needsSkill || needsRag);
+  const requiresEvidence = Boolean(plan.requiresEvidence || evidenceIntent || answerStrategy === "citation" || (taskType === "workflow" && needsSkill));
 
-  if (evidenceIntent && candidateCapabilities.length === 0) {
+  if (evidenceIntent && !candidateCapabilities.some((capability) => capability.startsWith("skill.") || capability.startsWith("mcp."))) {
     candidateCapabilities.push(selectQuerySkill(message));
   }
 
@@ -321,6 +332,26 @@ function hasWriteIntent(message: string): boolean {
   return /(写入数据库|保存到数据库|保存这段|采集这段|收集一下|保存|入库|存为资料|记录这篇|记录到知识库|保存到知识库|公众号文章)/u.test(message);
 }
 
+function extractPostWorkflowAnswerQuery(message: string, wechatUrl?: string): string | undefined {
+  if (!hasPostWorkflowAnswerIntent(message)) {
+    return undefined;
+  }
+
+  const withoutUrl = wechatUrl ? message.replace(wechatUrl, " ") : message;
+  const cleaned = withoutUrl
+    .replace(/^(请你|请|帮我)?\s*/, "")
+    .replace(/(把|将)?\s*(这篇|这个|公众号)?\s*(文章)?\s*(抓取|采集|保存|记录|入库|写入)(到)?(知识库|数据库)?/gu, " ")
+    .replace(/(把|将)?\s*(这篇|这篇文章|这个|该文章)/gu, " ")
+    .replace(/(然后|并且|同时|顺便|再|并)?\s*(回答|总结|分析|提炼|告诉我|说明|解释)(一下|问题)?[:：]?/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "请基于刚写入的公众号文章回答用户问题。";
+}
+
+function hasPostWorkflowAnswerIntent(message: string): boolean {
+  return hasWriteIntent(message) && /(回答|总结|分析|提炼|告诉我|说明|解释|然后|并且|同时|顺便|再|问题|观点|结论|为什么|如何|怎么)/u.test(message);
+}
+
 function extractImplicitEvidenceQuery(message: string): string | undefined {
   if (!hasImplicitEvidenceIntent(message)) {
     return undefined;
@@ -346,14 +377,14 @@ function isMultiStepRequest(message: string): boolean {
   return /(先.+再|多步|分别|对比|综合)/iu.test(message);
 }
 
-function normalizeAnswerStrategy(value: unknown, message: string, taskType: string, evidenceIntent: boolean) {
-  if (taskType === "workflow") {
+function normalizeAnswerStrategy(value: unknown, message: string, taskType: string, evidenceIntent: boolean, hasDownstreamAction = false) {
+  if (taskType === "workflow" && !hasDownstreamAction) {
     return "workflow" as const;
   }
   if (isCitationRequest(message)) {
     return "citation" as const;
   }
-  if (isMultiStepRequest(message)) {
+  if (isMultiStepRequest(message) || value === "multi_step") {
     return "multi_step" as const;
   }
   if (evidenceIntent || taskType === "rag_chat" || taskType === "skill_call") {

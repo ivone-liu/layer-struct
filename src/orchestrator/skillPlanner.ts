@@ -10,7 +10,12 @@ export class SkillPlanner {
     documentResolution?: DocumentResolution,
     memoryHits: MemoryHit[] = []
   ): SkillPlan {
-    if (routePlan.needsWorkflow || routePlan.taskType === "workflow") {
+    const workflowOnly =
+      (routePlan.needsWorkflow || routePlan.taskType === "workflow") &&
+      !routePlan.needsSkill &&
+      !routePlan.needsRag &&
+      !routePlan.candidateCapabilities.some((capability) => capability.startsWith("skill.") || capability.startsWith("mcp."));
+    if (workflowOnly) {
       return {
         answerStrategy: "workflow",
         calls: [],
@@ -107,6 +112,22 @@ export class SkillPlanner {
         requiresEvidence: true,
         canAnswerWithoutSkill: false,
         rationale: "用户问题依赖当前会话锚定文档。"
+      };
+    }
+
+
+    if (routePlan.needsWorkflow) {
+      addCall("skill.sqlite_query", "Workflow 写入后需要基于新文档继续回答，等待执行结果回填 documentId 后读取原文 chunks", {
+        query,
+        limit: 8,
+        ...documentParams
+      });
+      return {
+        answerStrategy: routePlan.answerStrategy === "multi_step" ? "multi_step" : "rag",
+        calls,
+        requiresEvidence: true,
+        canAnswerWithoutSkill: false,
+        rationale: "识别到 workflow 后还需要基于写入资料继续回答，生成 workflow + skill 编排计划。"
       };
     }
 

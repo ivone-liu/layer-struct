@@ -105,6 +105,7 @@ export class Orchestrator {
     routePlan.requiresEvidence = skillPlan.requiresEvidence;
 
     const executionResult = await this.executeIfNeeded(context, routePlan, undefined, context.userId);
+    this.bindWorkflowOutputToSkillPlan(skillPlan, executionResult);
     let { skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan);
     evidencePack = evidencePack ? await this.documents.expandEvidencePack({ ...evidencePack, memoryHits, retrievalSources: [...(evidencePack.retrievalSources ?? []), "memory_items"] }) : undefined;
     const guardAnswer = guardedNoEvidenceAnswer(skillPlan, observation);
@@ -237,6 +238,7 @@ export class Orchestrator {
       await tracker.skillPlan(skillPlan, renderSkillPlanMessage(skillPlan));
 
       executionResult = await this.executeIfNeeded(context, routePlan, tracker, context.userId);
+      this.bindWorkflowOutputToSkillPlan(skillPlan, executionResult);
       ({ skillResults, observation, evidencePack } = await this.executeSkillsIfNeeded(context, skillPlan, tracker));
       evidencePack = evidencePack ? await this.documents.expandEvidencePack({ ...evidencePack, memoryHits, retrievalSources: [...(evidencePack.retrievalSources ?? []), "memory_items"] }) : undefined;
 
@@ -330,6 +332,19 @@ export class Orchestrator {
       message: "文档已受理，SQLite/LanceDB 与 memory 正在异步写入。你可以继续提问，无需等待写入完成。",
       output: { documentId: result.document.id, title: result.document.title, tags: result.document.tags, chunkCount: result.chunkCount }
     };
+  }
+
+  private bindWorkflowOutputToSkillPlan(skillPlan?: SkillPlan, executionResult?: ExecutionResult): void {
+    const documentId = stringParam(executionResult?.output?.documentId);
+    if (!skillPlan || !documentId || executionResult?.status !== "success") {
+      return;
+    }
+
+    for (const call of skillPlan.calls) {
+      if ((call.skillId === "skill.sqlite_query" || call.skillId === "skill.lancedb_query") && typeof call.params.documentId !== "string") {
+        call.params = { ...call.params, documentId };
+      }
+    }
   }
 
   private async executeSkillsIfNeeded(
@@ -520,7 +535,7 @@ export class Orchestrator {
     sessionRequirementMemory?: SessionRequirementMemory
   ): Promise<GenerationInput> {
     const conversationContext = await this.contextCompressor.buildContextPack({ sessionId: context.sessionId, projectId: context.projectId, userId: context.userId });
-    if (executionResult?.capabilityId === "workflow.ingest_text_database" || executionResult?.capabilityId === "workflow.ingest_wechat_article" || executionResult?.capabilityId === "workflow.ingest_collected_content") {
+    if (isWorkflowExecutionResult(executionResult) && !hasDownstreamAnswerWork(routePlan, skillPlan, skillResults)) {
       return { kind: "static", answer: this.renderWorkflowAnswer(executionResult), conversationContext };
     }
 
@@ -752,6 +767,26 @@ function mergeEvidencePacks(skillResults: SkillExecutionResult[]): EvidencePack 
   }
   if (skillResults.length === 0) return undefined;
   return { query: [...new Set(queries)].join(" | "), skillId: [...new Set(skillIds)].join(","), items };
+}
+
+function isWorkflowExecutionResult(executionResult?: ExecutionResult): executionResult is ExecutionResult {
+  return Boolean(
+    executionResult?.capabilityId === "workflow.ingest_text_database" ||
+      executionResult?.capabilityId === "workflow.ingest_wechat_article" ||
+      executionResult?.capabilityId === "workflow.ingest_collected_content"
+  );
+}
+
+function hasDownstreamAnswerWork(routePlan: RoutePlan, skillPlan?: SkillPlan, skillResults?: SkillExecutionResult[]): boolean {
+  return Boolean(
+    routePlan.needsSkill ||
+      routePlan.needsRag ||
+      routePlan.answerStrategy === "rag" ||
+      routePlan.answerStrategy === "citation" ||
+      routePlan.answerStrategy === "multi_step" ||
+      (skillPlan?.calls.length ?? 0) > 0 ||
+      (skillResults?.length ?? 0) > 0
+  );
 }
 
 function renderAmbiguousDocumentAnswer(candidates: Array<{ documentId: string; title: string; source?: string; reason: string }>): string {
